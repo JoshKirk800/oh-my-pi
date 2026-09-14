@@ -415,6 +415,13 @@ export class ModelControls {
 			if (apiKeysByProvider.has(provider)) {
 				apiKey = apiKeysByProvider.get(provider);
 			} else {
+				// Apply the startup default for THIS provider before resolving its
+				// key: automatic ranking would otherwise stick an account the
+				// moment nothing is active yet, and once active the pin can no
+				// longer override it (see `#cycleAvailableModel`'s identical guard).
+				// Every distinct provider among the scoped models goes through
+				// this filter before any of them is actually switched to.
+				this.#host.applyStartupOAuthAccountPin(provider, this.#host.sessionId());
 				apiKey = await this.#host.modelRegistry.getApiKeyForProvider(provider, this.#host.sessionId());
 				apiKeysByProvider.set(provider, apiKey);
 			}

@@ -448,6 +448,55 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(remote.snapshot.credentials[0]?.identityKey).toBe(allowed.identityKey);
 	});
 
+	test("notifies onSnapshot with the raw (unfiltered) credentials for an SSE delta, not the pool-filtered view", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initialResult = await client.fetchSnapshot();
+		if (initialResult.status !== 200) throw new Error("expected initial snapshot");
+		const allowed = initialResult.snapshot.credentials[0];
+		if (!allowed?.identityKey) throw new Error("expected OAuth identity key");
+		const callbacks: SnapshotResponse[] = [];
+		remote = new RemoteAuthCredentialStore({
+			client,
+			initialSnapshot: initialResult.snapshot,
+			accountPool: new Map([["anthropic", new Set([allowed.identityKey])]]),
+			onSnapshot: snapshot => {
+				callbacks.push(snapshot);
+			},
+		});
+
+		// Warm up the SSE connection with a pool-excluded credential first: the
+		// very first server-side change after a fresh connection can arrive as
+		// a full "snapshot" frame (already covered by #applySnapshot's own
+		// always-correct raw payload) rather than the "entry" delta this test
+		// targets. Only once that frame has landed is a LATER change
+		// guaranteed to arrive as a genuine delta.
+		storage!.upsertCredential("anthropic", mintOAuthCredential("warmup", Date.now() + 120_000));
+		await waitUntil(() => remote!.snapshot.generation > initialResult.snapshot.generation);
+		callbacks.length = 0;
+		const initialGeneration = remote!.snapshot.generation;
+
+		storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		await waitUntil(() => remote!.snapshot.generation > initialGeneration);
+
+		// The filtered view correctly excludes both "warmup" and "b" (outside
+		// the account pool) -- same invariant as the neighboring "advances the
+		// SSE generation..." test.
+		expect(remote.snapshot.credentials).toHaveLength(1);
+		expect(remote.snapshot.credentials[0]?.identityKey).toBe(allowed.identityKey);
+		// ...but the onSnapshot payload for this delta -- persisted verbatim to
+		// the on-disk startup cache by discover.ts's `persist` callback -- must
+		// still carry every credential the broker actually has (the allowed
+		// account plus both pool-excluded ones), or an excluded credential
+		// silently vanishes from that cache the moment any OTHER credential
+		// changes while the filter is active.
+		const lastNotified = callbacks.at(-1);
+		const emails = lastNotified?.credentials
+			.map(entry => (entry.credential.type === "oauth" ? entry.credential.email : undefined))
+			.filter((email): email is string => Boolean(email))
+			.sort();
+		expect(emails).toEqual(["a@example.com", "b@example.com", "warmup@example.com"]);
+	});
+
 	test("treats a missing provider as unrestricted and an empty provider pool as OAuth-disabled", async () => {
 		storage!.upsertCredential("openai-codex", mintOAuthCredential("codex", Date.now() + 120_000));
 		const client = new AuthBrokerClient({ url: handle!.url, token });

@@ -1914,6 +1914,7 @@ export class AgentSession {
 			isGeneratingHandoff: () => this.isGeneratingHandoff,
 			promptGeneration: () => this.#promptGeneration,
 			sessionId: () => this.sessionId,
+			applyStartupOAuthAccountPin: (provider, sessionId) => this.#applyStartupOAuthAccountPin(provider, sessionId),
 			messages: () => this.messages,
 			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
 			goalModeState: () => this.#goalModeState,
