@@ -2021,6 +2021,8 @@ export class SessionAdvisors {
 		});
 
 		for (const candidate of candidates) {
+			if (advisorProviderSessionId)
+				this.#host.applyStartupOAuthAccountPin(candidate.provider, advisorProviderSessionId);
 			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisorProviderSessionId, { signal });
 			if (!apiKey) continue;
 			if (

@@ -3245,6 +3245,7 @@ export class SessionMaintenance {
 		let nativeCompactionFailure: { error: NativeCompactionError; provider: string } | undefined;
 
 		for (const candidate of candidates) {
+			this.#host.applyStartupOAuthAccountPin(candidate.provider, this.#host.sessionId());
 			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 			if (!apiKey) continue;
 			if (
@@ -4626,6 +4627,7 @@ export class SessionMaintenance {
 				for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
 					const candidate = candidates[candidateIndex];
 					const hasMoreCandidates = candidateIndex < candidates.length - 1;
+					this.#host.applyStartupOAuthAccountPin(candidate.provider, this.#host.sessionId());
 					const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 					if (!apiKey) continue;
 					if (
