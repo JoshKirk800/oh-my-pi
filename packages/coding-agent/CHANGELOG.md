@@ -410,6 +410,9 @@
 - Browsers spawned via `app.path` into an omp-owned profile no longer trigger the macOS "wants to use your confidential information in Safe Storage" keychain dialog.
 - Reading Hugging Face file URLs (`/raw/...`, `/resolve/...`, `/blob/...`, `/tree/...`) now returns the file instead of the repo's model/dataset card.
 - Directory reads no longer append a bogus `[1 results limit reached. Use limit=2 for more]` notice (`read` has no `limit`); capped child directories show only their inline `… N more` marker, and the prompt documents paging with `:N-M`/`:-N`.
+### Added
+
+- Added `auth.startupOAuthAccount` and `omp auth accounts|pin|unpin <provider> [selector]` to pin a specific stored OAuth account per provider as the one a new session starts on (also applied to advisors' own provider sessions and re-tried once an account that was not yet visible, e.g. behind a stale auth-broker snapshot, appears); a rate limit on the pinned account still fails over to a sibling automatically, and a resumed session's own recorded account or a live `/session pin` always takes precedence. Added `/switchaccount [account]` to switch a running session's OAuth account for the current provider without leaving the TUI ([#11717](https://github.com/can1357/oh-my-pi/pull/11717) by [@JoshKirk800](https://github.com/JoshKirk800)).
 
 ## [18.1.22] - 2026-09-14
 
@@ -421,7 +424,6 @@
 
 - Added a privacy warning to memory reports reminding users to review data for secrets before sharing
 - `omp git` / `/git`: `delete` discards the selected file's changes (press twice to confirm) — in the sidebar on a file or whole directory, in the diff pane on the shown file; untracked files are removed, staged files reset to HEAD
-- Added `auth.startupOAuthAccount` and `omp auth accounts|pin|unpin <provider> [selector]` to pin a specific stored OAuth account per provider as the one a new session starts on (also applied to advisors' own provider sessions and re-tried once an account that was not yet visible, e.g. behind a stale auth-broker snapshot, appears); a rate limit on the pinned account still fails over to a sibling automatically, and a resumed session's own recorded account or a live `/session pin` always takes precedence. Added `/switchaccount [account]` to switch a running session's OAuth account for the current provider without leaving the TUI ([#11717](https://github.com/can1357/oh-my-pi/pull/11717) by [@JoshKirk800](https://github.com/JoshKirk800)).
 
 ### Changed
 

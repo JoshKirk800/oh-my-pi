@@ -43,13 +43,15 @@
 ### Fixed
 
 - Fixed OpenCode Go window-limit 429s (`5-hour`/`Weekly`/`Monthly usage limit reached. Resets in …`) not pinning the exhausted credential to the server-stated reset; the window phrasing is now covered by a regression test over the rotation classifier. ([#12091](https://github.com/can1357/oh-my-pi/pull/12091) by [@H4vC](https://github.com/H4vC))
+### Fixed
+
+- Fixed a session's sticky OAuth/API-key account silently repointing to whatever credential now occupies its old storage position after the credential list was reordered or shrank mid-process (a sibling `/logout` from another process, or an auth-broker snapshot delivery): the in-memory sticky is now re-resolved from its durable credential id on every read, matching the persisted-cache path. A background auth-broker snapshot delivery now also refreshes `AuthStorage`'s own cached view and bumps its generation, so `onGenerationChanged` subscribers see accounts that appeared after the cached startup snapshot ([#11717](https://github.com/can1357/oh-my-pi/pull/11717) by [@JoshKirk800](https://github.com/JoshKirk800)).
 
 ## [18.1.22] - 2026-09-14
 
 ### Fixed
 
 - 400-request debug dumps now redact provider-specific auth headers (`x-goog-api-key`, `x-amz-security-token`, and any header whose name carries a key/token/secret), not just a fixed allow-list, so a shared dump can no longer leak a live API key ([#12007](https://github.com/can1357/oh-my-pi/issues/12007)).
-- Fixed a session's sticky OAuth/API-key account silently repointing to whatever credential now occupies its old storage position after the credential list was reordered or shrank mid-process (a sibling `/logout` from another process, or an auth-broker snapshot delivery): the in-memory sticky is now re-resolved from its durable credential id on every read, matching the persisted-cache path. A background auth-broker snapshot delivery now also refreshes `AuthStorage`'s own cached view and bumps its generation, so `onGenerationChanged` subscribers see accounts that appeared after the cached startup snapshot ([#11717](https://github.com/can1357/oh-my-pi/pull/11717) by [@JoshKirk800](https://github.com/JoshKirk800)).
 
 ## [18.1.20] - 2026-09-13
 
