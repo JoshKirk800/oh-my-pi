@@ -1539,8 +1539,19 @@ export class SessionAdvisors {
 		});
 	}
 
-	/** Switch one advisor model while preserving its context and effort invariants. */
+	/**
+	 * Switch one advisor model while preserving its context and effort
+	 * invariants. Every in-flight advisor model change funnels through here
+	 * (retry-fallback primary restore, cross-provider failure fallback, context
+	 * promotion), so this is also where a PROVIDER change re-applies the
+	 * `auth.startupOAuthAccount` default for the advisor's own provider-session
+	 * id — mirroring the primary's `#setModelWithProviderSessionReset`. The id
+	 * itself is stable across the switch, so without this an advisor landing on
+	 * provider Q starts on automatic ranking for Q and can consume the account
+	 * the setting reserved there.
+	 */
 	#setAdvisorModel(advisor: ActiveAdvisor, model: Model, requestedThinkingLevel: ThinkingLevel): ThinkingLevel {
+		const providerChanged = advisor.model.provider !== model.provider;
 		const resolvedThinkingLevel = resolveThinkingLevelForModel(model, requestedThinkingLevel);
 		const nextThinkingLevel = resolvedThinkingLevel ?? ThinkingLevel.Inherit;
 		advisor.agent.setModel(model);
@@ -1549,6 +1560,9 @@ export class SessionAdvisors {
 		advisor.agent.appendOnlyContext?.invalidateForModelChange();
 		advisor.model = model;
 		advisor.thinkingLevel = nextThinkingLevel;
+		if (providerChanged && advisor.providerSessionId) {
+			this.#host.applyStartupOAuthAccountPin(model.provider, advisor.providerSessionId);
+		}
 		return nextThinkingLevel;
 	}
 

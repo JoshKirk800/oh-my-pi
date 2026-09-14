@@ -146,30 +146,61 @@ describe("omp auth (contract)", () => {
 		await runAuthCommand({ action: "pin", provider: "anthropic", selector: "Org A" });
 		expect(logs.join("\n")).toContain("higher-precedence project or overlay config");
 	});
-	it("persists a durable selector that survives a sibling account being removed (/logout)", async () => {
-		seedSharedEmailAccounts();
-		// Pin "Org A" — position 0 at the time of pinning.
-		await runAuthCommand({ action: "pin", provider: "anthropic", selector: "Org A" });
 
-		// Remove "Org B" the way `/logout` does: the AuthStorage-level delete.
-		// If the persisted selector were the 1-based position instead of a
-		// durable id, this wouldn't change anything for account 1 — but the
-		// regression this guards is the reverse direction (removing an
-		// EARLIER account would shift a later one into position 1). Removing
-		// the sibling here is enough to prove the persisted value is not a
-		// position that could have been invalidated by any removal at all.
+	it("persists a durable selector that survives an earlier sibling account being removed (/logout)", async () => {
+		seedSharedEmailAccounts();
+		// Pin "Org B" — position 2 at the time of pinning. A positional selector
+		// would persist "2".
+		await runAuthCommand({ action: "pin", provider: "anthropic", selector: "Org B" });
+
+		// Remove "Org A" (position 1) the way `/logout` does. Org B now slides
+		// into position 1: a persisted "2" would point at nothing (or, with a
+		// third account, at the wrong org), while the durable
+		// `OAuth credential #<id>` form keeps resolving to Org B.
 		const authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(getAgentDbPath(agentDir.path()))));
 		await authStorage.reload();
-		const before = authStorage.listOAuthAccounts("anthropic");
-		const orgB = before.find(a => a.orgName === "Org B");
-		if (!orgB) throw new Error("expected Org B to be seeded");
-		await authStorage.removeCredential("anthropic", orgB.credentialId);
+		const orgA = authStorage.listOAuthAccounts("anthropic").find(a => a.orgName === "Org A");
+		if (!orgA) throw new Error("expected Org A to be seeded");
+		await authStorage.removeCredential("anthropic", orgA.credentialId);
 		authStorage.close();
 
 		logs = [];
 		await runAuthCommand({ action: "accounts", provider: "anthropic" });
 		const output = logs.join("\n");
-		expect(output).toContain("shared@example.com (Org A) [pinned]");
+		expect(output).toContain("1. shared@example.com (Org B) [pinned]");
+		expect(output).not.toContain("ambiguous");
+		expect(output).not.toContain("no longer valid");
+	});
+
+	it("omp auth accounts reports a non-string configured value instead of crashing", async () => {
+		seedSharedEmailAccounts();
+		// A hand-edited `anthropic: 1` (unquoted YAML) or the generic /settings
+		// record editor can store a number here; the schema is a plain record, so
+		// the typed setter has to be bypassed the same way a raw config write is.
+		Settings.instance.set("auth.startupOAuthAccount", { anthropic: 1 } as unknown as Record<string, string>);
+		await Settings.instance.flush();
+
+		await runAuthCommand({ action: "accounts", provider: "anthropic" });
+		expect(errors).toEqual([]);
+		const output = logs.join("\n");
+		expect(output).toContain("1. shared@example.com (Org A)");
+		expect(output).toContain("2. shared@example.com (Org B)");
+		expect(output).not.toContain("[pinned]");
+		expect(output).toContain("is not a string selector");
+	});
+
+	it("omp auth unpin warns when the only pin lives in a project layer instead of claiming nothing is pinned", async () => {
+		await Bun.write(
+			path.join(projectDir.path(), ".omp", "config.yml"),
+			'auth:\n  startupOAuthAccount:\n    anthropic: "OAuth credential #1"\n',
+		);
+		resetSettingsForTest();
+		await Settings.init({ agentDir: agentDir.path(), cwd: projectDir.path() });
+
+		await runAuthCommand({ action: "unpin", provider: "anthropic" });
+		const output = logs.join("\n");
+		expect(output).toContain("higher-precedence project or overlay config");
+		expect(output).toContain('"OAuth credential #1"');
 	});
 
 	it("keeps a solo account pinned after a same-email sibling is added later via /login", async () => {

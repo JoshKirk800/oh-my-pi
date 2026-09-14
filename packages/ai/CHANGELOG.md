@@ -49,6 +49,7 @@
 ### Fixed
 
 - 400-request debug dumps now redact provider-specific auth headers (`x-goog-api-key`, `x-amz-security-token`, and any header whose name carries a key/token/secret), not just a fixed allow-list, so a shared dump can no longer leak a live API key ([#12007](https://github.com/can1357/oh-my-pi/issues/12007)).
+- Fixed a session's sticky OAuth/API-key account silently repointing to whatever credential now occupies its old storage position after the credential list was reordered or shrank mid-process (a sibling `/logout` from another process, or an auth-broker snapshot delivery): the in-memory sticky is now re-resolved from its durable credential id on every read, matching the persisted-cache path. A background auth-broker snapshot delivery now also refreshes `AuthStorage`'s own cached view and bumps its generation, so `onGenerationChanged` subscribers see accounts that appeared after the cached startup snapshot ([#11717](https://github.com/can1357/oh-my-pi/pull/11717) by [@JoshKirk800](https://github.com/JoshKirk800)).
 
 ## [18.1.20] - 2026-09-13
 

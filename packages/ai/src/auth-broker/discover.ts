@@ -312,7 +312,13 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 				// chance to re-resolve. `store.listAuthCredentials()` already
 				// reads this delivery's data live; `reload()` is what makes
 				// `AuthStorage`'s cached view (and generation counter) catch up.
-				void storage?.reload();
+				// `reload()` rethrows on store corruption; this runs from a
+				// background delivery for the life of the process, so the
+				// rejection must be observed here (like `persist` above) rather
+				// than surface as a process-fatal unhandled rejection.
+				void storage?.reload().catch(error => {
+					logger.debug("auth-broker background snapshot reload failed", { error: String(error) });
+				});
 			},
 			accountPool,
 		});

@@ -90,7 +90,11 @@ export async function runAuthCommand(cmd: AuthCommandArgs): Promise<void> {
 	if (cmd.action === "unpin") {
 		const configured = globalStartupOAuthAccounts();
 		if (!(provider in configured)) {
-			console.log(chalk.dim(`No startup account pinned for "${provider}".`));
+			console.log(chalk.dim(`No startup account pinned for "${provider}" in the global config.`));
+			// Nothing to clear globally, but a project/overlay layer can still pin
+			// this provider — say so instead of implying sessions now start on
+			// automatic ranking.
+			warnIfShadowed(provider, undefined);
 			return;
 		}
 		delete configured[provider];
@@ -111,16 +115,27 @@ export async function runAuthCommand(cmd: AuthCommandArgs): Promise<void> {
 		}
 
 		if (cmd.action === "accounts") {
-			const pinnedSelector = (settings.get("auth.startupOAuthAccount") as Record<string, string> | undefined)?.[
+			// Same runtime guard as `AgentSession#applyStartupOAuthAccountPin`: the
+			// schema is a generic record, so a hand-edited `anthropic: 1` or the
+			// generic /settings editor can store a non-string here, and
+			// `matchOAuthAccountsBySelector` would throw on `.trim()`.
+			const configuredValue = (settings.get("auth.startupOAuthAccount") as Record<string, unknown> | undefined)?.[
 				provider
 			];
+			const pinnedSelector = typeof configuredValue === "string" ? configuredValue.trim() : undefined;
 			const pinnedMatches = pinnedSelector ? matchOAuthAccountsBySelector(accounts, pinnedSelector) : [];
 			const pinnedId = pinnedMatches.length === 1 ? pinnedMatches[0].credentialId : undefined;
 			for (const account of accounts) {
 				const pinned = account.credentialId === pinnedId ? chalk.dim(" [pinned]") : "";
 				console.log(`${account.position + 1}. ${accountLabel(account)}${pinned}`);
 			}
-			if (pinnedSelector && pinnedMatches.length !== 1) {
+			if (configuredValue !== undefined && pinnedSelector === undefined) {
+				console.log(
+					chalk.yellow(
+						`Note: the configured value for "${provider}" (${JSON.stringify(configuredValue)}) is not a string selector — no account will be auto-pinned at session start until it's fixed (see \`omp auth pin\`).`,
+					),
+				);
+			} else if (pinnedSelector && pinnedMatches.length !== 1) {
 				console.log(
 					chalk.yellow(
 						`Note: the configured selector "${pinnedSelector}" for "${provider}" is ${

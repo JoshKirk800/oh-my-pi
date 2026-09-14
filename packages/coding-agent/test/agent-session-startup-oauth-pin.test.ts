@@ -159,16 +159,17 @@ describe("AgentSession startup OAuth account pin", () => {
 		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
 
 		let session: AgentSession | undefined;
+		cleanup.push(async () => {
+			await session?.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		});
 		expect(() => {
 			session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
 		}).not.toThrow();
 
 		const accounts = await session?.listCurrentProviderOAuthAccounts();
 		expect(accounts?.accounts.some(a => a.active)).toBe(false);
-
-		await session?.dispose();
-		authStorage.close();
-		tempDir.removeSync();
 	});
 
 	it("reapplies the startup default when /model switches provider", async () => {
@@ -187,6 +188,11 @@ describe("AgentSession startup OAuth account pin", () => {
 		const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
 		const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		cleanup.push(async () => {
+			await session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		});
 
 		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.find(a => a.active)?.accountId).toBe(
 			"account-a",
@@ -199,10 +205,6 @@ describe("AgentSession startup OAuth account pin", () => {
 
 		const openaiAccounts = authStorage.listOAuthAccounts("openai", session.sessionId);
 		expect(openaiAccounts.find(a => a.active)?.accountId).toBe("account-o");
-
-		await session.dispose();
-		authStorage.close();
-		tempDir.removeSync();
 	});
 
 	it("propagates the startup pin to an enabled advisor's own provider-session id", async () => {
@@ -241,6 +243,11 @@ describe("AgentSession startup OAuth account pin", () => {
 		const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
 		const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		cleanup.push(async () => {
+			await session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		});
 		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
 		session.toggleAdvisorEnabled();
 		const advisorAgent = session.getAdvisorAgent();
@@ -265,10 +272,6 @@ describe("AgentSession startup OAuth account pin", () => {
 		expect(authStorage.listOAuthAccounts("anthropic", advisorSessionId).find(a => a.active)?.accountId).toBe(
 			"account-c",
 		);
-
-		await session.dispose();
-		authStorage.close();
-		tempDir.removeSync();
 	});
 
 	it("retry overrides an automatically-selected sticky once the configured account becomes resolvable", async () => {
@@ -286,6 +289,11 @@ describe("AgentSession startup OAuth account pin", () => {
 		const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
 		const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		cleanup.push(async () => {
+			await session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		});
 		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.some(a => a.active)).toBe(false);
 
 		// A real request routes to "a" (the only stored account) through
@@ -310,10 +318,6 @@ describe("AgentSession startup OAuth account pin", () => {
 		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.find(a => a.active)?.accountId).toBe(
 			"account-c",
 		);
-
-		await session.dispose();
-		authStorage.close();
-		tempDir.removeSync();
 	});
 
 	it("retry never overrides a deliberate manual /session pin issued during the same unresolved window", async () => {
@@ -330,6 +334,11 @@ describe("AgentSession startup OAuth account pin", () => {
 		const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
 		const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		cleanup.push(async () => {
+			await session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		});
 		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.some(a => a.active)).toBe(false);
 
 		// The user deliberately pins "a" through the real public API
@@ -351,9 +360,80 @@ describe("AgentSession startup OAuth account pin", () => {
 		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.find(a => a.active)?.accountId).toBe(
 			"account-a",
 		);
+	});
+
+	it("a resumed session-file pin still wins when its account only becomes visible after the startup default's", async () => {
+		const tempDir = TempDir.createSync("@pi-startup-oauth-pin-resume-race-");
+		const cwd = tempDir.path();
+		const dbPath = path.join(cwd, "auth.db");
+		const store = new SqliteAuthCredentialStore(new Database(dbPath));
+		// Only the startup default's account "a" is visible at construction; the
+		// resumed session's recorded account "b" is not (stale broker snapshot).
+		store.saveOAuth("anthropic", mintOAuthCredential("a"));
+		const authStorage = new AuthStorage(store);
+		await authStorage.reload();
+
+		const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const hash = credentialPinHash("anthropic", { accountId: "account-b", email: "b@example.com" });
+		if (!hash) throw new Error("expected a pin hash");
+		sessionManager.appendCredentialPin("anthropic", hash);
+
+		const settings = Settings.isolated({ "auth.startupOAuthAccount": { anthropic: "a@example.com" } });
+		const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"), { settings });
+		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
+		const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		cleanup.push(async () => {
+			await session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		});
+
+		// The default must NOT claim the session just because it resolved first:
+		// a recorded pin outranks it whether or not it is seedable yet. Otherwise
+		// the later `seedCredentialPins` retry sees an active account and skips,
+		// permanently inverting the documented precedence.
+		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.some(a => a.active)).toBe(false);
+
+		const secondStore = new SqliteAuthCredentialStore(new Database(dbPath));
+		secondStore.saveOAuth("anthropic", mintOAuthCredential("b"));
+		secondStore.close();
+		await authStorage.reload();
+
+		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.find(a => a.active)?.accountId).toBe(
+			"account-b",
+		);
+	});
+
+	it("stops retrying the startup pin once the session is disposed", async () => {
+		const tempDir = TempDir.createSync("@pi-startup-oauth-pin-dispose-");
+		const cwd = tempDir.path();
+		const dbPath = path.join(cwd, "auth.db");
+		const store = new SqliteAuthCredentialStore(new Database(dbPath));
+		store.saveOAuth("anthropic", mintOAuthCredential("a"));
+		const authStorage = new AuthStorage(store);
+		await authStorage.reload();
+
+		const settings = Settings.isolated({ "auth.startupOAuthAccount": { anthropic: "c@example.com" } });
+		const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"), { settings });
+		const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
+		const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		cleanup.push(() => {
+			authStorage.close();
+			tempDir.removeSync();
+		});
+		const sessionId = session.sessionId;
+		expect(authStorage.listOAuthAccounts("anthropic", sessionId).some(a => a.active)).toBe(false);
 
 		await session.dispose();
-		authStorage.close();
-		tempDir.removeSync();
+
+		// The configured account appears only after disposal. A disposed session
+		// must not keep writing credential pins for an id nothing will use again.
+		const secondStore = new SqliteAuthCredentialStore(new Database(dbPath));
+		secondStore.saveOAuth("anthropic", mintOAuthCredential("c"));
+		secondStore.close();
+		await authStorage.reload();
+
+		expect(authStorage.listOAuthAccounts("anthropic", sessionId).some(a => a.active)).toBe(false);
 	});
 });

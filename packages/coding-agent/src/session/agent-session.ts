@@ -2055,18 +2055,27 @@ export class AgentSession {
 				logger.warn("Code Mode reconcile after setting change failed", { error: String(error) });
 			});
 		});
-		// Retry the configured startup default whenever new credentials become
-		// visible after this session's provider identity was already primed:
-		// resolving against a stale auth-broker snapshot cache (packages/ai's
+		// Retry account pinning whenever new credentials become visible after
+		// this session's provider identity was already primed: resolving against
+		// a stale auth-broker snapshot cache (packages/ai's
 		// RemoteAuthCredentialStore can serve a cached snapshot while it
 		// refreshes in the background) or a sibling process logging in locally
-		// can both leave `#applyStartupOAuthAccountPin` with zero matches on its
-		// first call. `allowOverrideAutoSticky` lets this retry correct a sticky
+		// can both leave the first pass with zero matches. Same precedence and
+		// order as `#syncAgentSessionId`: the resumed session-file pin
+		// (`seedCredentialPins`, which no-ops until its account is visible and
+		// once anything is active) first, then the configured startup default.
+		// `allowOverrideAutoSticky` lets the default's retry correct a sticky
 		// that ordinary ranking created in the meantime (a real request routed
 		// to a sibling account before the configured one became resolvable) --
 		// see `#pendingStartupOAuthPins` for why this can never override a
-		// resumed or deliberate manual pin.
+		// resumed or deliberate manual pin. Guarded on disposal: this fires from
+		// AuthStorage for as long as the subscription lives, which outlasts
+		// `beginDispose()`.
 		this.#unsubscribeAuthStorageGeneration = this.#modelRegistry.authStorage.onGenerationChanged(() => {
+			if (this.#isDisposed) return;
+			if (!this.#freshProviderSessionId) {
+				seedCredentialPins(this.#modelRegistry.authStorage, this.sessionManager, this.sessionId);
+			}
 			this.#applyStartupOAuthAccountPin(undefined, undefined, { allowOverrideAutoSticky: true });
 			this.#advisors.reapplyStartupOAuthAccountPins();
 		});
@@ -4614,6 +4623,10 @@ export class AgentSession {
 		this.agent.setMetadataResolver((provider: string) =>
 			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage),
 		);
+		// Every pending startup-pin window refers to the previous identity (the
+		// primary's `sid` and every advisor id derived from it); the retry only
+		// ever re-checks the current ids, so stale keys would just accumulate.
+		this.#pendingStartupOAuthPins.clear();
 		// Restore the session's recorded provider accounts before the first
 		// request routes: sticky rows are process-local under a remote auth
 		// broker, and losing them re-ranks onto a different account, cold-missing
@@ -4966,6 +4979,7 @@ export class AgentSession {
 			this.#unsubscribeAuthStorageGeneration();
 			this.#unsubscribeAuthStorageGeneration = undefined;
 		}
+		this.#pendingStartupOAuthPins.clear();
 		this.#eventListeners = [];
 		this.#runStateListeners.clear();
 		this.#sessionChangeCallbacks.clear();
@@ -10740,6 +10754,24 @@ export class AgentSession {
 		const selector = typeof configuredValue === "string" ? configuredValue.trim() : undefined;
 		if (!selector) return;
 		const key = `${provider}\0${sessionId}`;
+		// A resumed session's own recorded account (`credential_pin` in the
+		// session file) always outranks the configured default for the primary
+		// session, whether or not `seedCredentialPins` could restore it yet: under
+		// a stale broker snapshot the recorded account can be invisible while the
+		// default's account resolves, and pinning the default here would make the
+		// later `seedCredentialPins` retry skip ("something is already active"),
+		// permanently inverting the documented precedence. Fresh provider sessions
+		// (`/fresh`) explicitly discard the recorded routing identity, matching
+		// `#syncAgentSessionId`'s own `seedCredentialPins` guard. Advisors never
+		// record session-file pins, so this only applies to the primary id.
+		if (
+			sessionId === this.sessionId &&
+			!this.#freshProviderSessionId &&
+			this.sessionManager.getCredentialPins().has(provider)
+		) {
+			this.#pendingStartupOAuthPins.delete(key);
+			return;
+		}
 		const authStorage = this.#modelRegistry.authStorage;
 		const accounts = authStorage.listOAuthAccounts(provider, sessionId);
 		const hasActive = accounts.some(account => account.active);
