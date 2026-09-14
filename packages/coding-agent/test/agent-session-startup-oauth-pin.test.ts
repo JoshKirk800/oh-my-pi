@@ -270,4 +270,90 @@ describe("AgentSession startup OAuth account pin", () => {
 		authStorage.close();
 		tempDir.removeSync();
 	});
+
+	it("retry overrides an automatically-selected sticky once the configured account becomes resolvable", async () => {
+		const tempDir = TempDir.createSync("@pi-startup-oauth-pin-auto-override-");
+		const cwd = tempDir.path();
+		const dbPath = path.join(cwd, "auth.db");
+		const store = new SqliteAuthCredentialStore(new Database(dbPath));
+		store.saveOAuth("anthropic", mintOAuthCredential("a"));
+		const authStorage = new AuthStorage(store);
+		await authStorage.reload();
+
+		// Selector for account "c", which does not exist yet.
+		const settings = Settings.isolated({ "auth.startupOAuthAccount": { anthropic: "c@example.com" } });
+		const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"), { settings });
+		const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
+		const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.some(a => a.active)).toBe(false);
+
+		// A real request routes to "a" (the only stored account) through
+		// ordinary automatic ranking before the configured account is visible
+		// -- same storage effect as ranking's own sticky recording, since
+		// `pinSessionOAuthAccount` and automatic ranking share the same
+		// underlying `#recordSessionCredential`.
+		const accountA = authStorage.listOAuthAccounts("anthropic", session.sessionId)[0];
+		if (!accountA) throw new Error("expected account a");
+		expect(authStorage.pinSessionOAuthAccount("anthropic", session.sessionId, accountA.credentialId)).toBe(true);
+
+		// "c" becomes visible later (broker snapshot catching up / sibling
+		// process `/login`); the generation-changed retry must override the
+		// incidental "a" sticky now that the configured selector resolves --
+		// the old blanket "something is active, never touch it" guard would
+		// leave this permanently stuck on "a".
+		const secondStore = new SqliteAuthCredentialStore(new Database(dbPath));
+		secondStore.saveOAuth("anthropic", mintOAuthCredential("c"));
+		secondStore.close();
+		await authStorage.reload();
+
+		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.find(a => a.active)?.accountId).toBe(
+			"account-c",
+		);
+
+		await session.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+	});
+
+	it("retry never overrides a deliberate manual /session pin issued during the same unresolved window", async () => {
+		const tempDir = TempDir.createSync("@pi-startup-oauth-pin-manual-protect-");
+		const cwd = tempDir.path();
+		const dbPath = path.join(cwd, "auth.db");
+		const store = new SqliteAuthCredentialStore(new Database(dbPath));
+		store.saveOAuth("anthropic", mintOAuthCredential("a"));
+		const authStorage = new AuthStorage(store);
+		await authStorage.reload();
+
+		const settings = Settings.isolated({ "auth.startupOAuthAccount": { anthropic: "c@example.com" } });
+		const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"), { settings });
+		const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
+		const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.some(a => a.active)).toBe(false);
+
+		// The user deliberately pins "a" through the real public API
+		// (`/session pin`'s own call target) during the same window the
+		// startup selector is still unresolved.
+		const accountA = authStorage.listOAuthAccounts("anthropic", session.sessionId)[0];
+		if (!accountA) throw new Error("expected account a");
+		expect(session.pinCurrentProviderOAuthAccount(accountA.credentialId)).toBe(true);
+
+		// "c" (the configured default) becomes visible later. The retry must
+		// NOT override the user's deliberate choice just because it happened
+		// to run during the same unresolved window an automatic pick would
+		// have used.
+		const secondStore = new SqliteAuthCredentialStore(new Database(dbPath));
+		secondStore.saveOAuth("anthropic", mintOAuthCredential("c"));
+		secondStore.close();
+		await authStorage.reload();
+
+		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.find(a => a.active)?.accountId).toBe(
+			"account-a",
+		);
+
+		await session.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+	});
 });

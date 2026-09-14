@@ -410,7 +410,11 @@ export interface SessionAdvisorsHost {
 	 * random UUIDs credential stickiness is keyed on, so the primary
 	 * session's pin never covers them on its own.
 	 */
-	applyStartupOAuthAccountPin(provider: string, sessionId: string): void;
+	applyStartupOAuthAccountPin(
+		provider: string,
+		sessionId: string,
+		options?: { allowOverrideAutoSticky?: boolean },
+	): void;
 }
 
 /**
@@ -715,12 +719,19 @@ export class SessionAdvisors {
 	 * Called from `AgentSession`'s `AuthStorage.onGenerationChanged` listener:
 	 * a selector that matched nothing when an advisor's identity was first
 	 * primed (stale broker snapshot cache, a sibling process's `/login` not
-	 * yet visible) can become resolvable once new credentials appear.
+	 * yet visible) can become resolvable once new credentials appear. Passes
+	 * `allowOverrideAutoSticky` so this can also correct a sticky ordinary
+	 * ranking created for the advisor in that same window — safe because the
+	 * host only honors it while the pair is still `#pendingStartupOAuthPins`,
+	 * i.e. nothing has settled it (successfully applied, or otherwise made
+	 * active) since.
 	 */
 	reapplyStartupOAuthAccountPins(): void {
 		for (const advisor of this.#advisors) {
 			if (advisor.providerSessionId)
-				this.#host.applyStartupOAuthAccountPin(advisor.model.provider, advisor.providerSessionId);
+				this.#host.applyStartupOAuthAccountPin(advisor.model.provider, advisor.providerSessionId, {
+					allowOverrideAutoSticky: true,
+				});
 		}
 	}
 

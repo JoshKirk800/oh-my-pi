@@ -122,6 +122,38 @@ describe("AuthStorage OAuth account selection", () => {
 				sessionId: "child-session",
 			}),
 		).toBe("a@example.com");
+
+	test("keeps the correct account active after reload() reorders credentials mid-process", async () => {
+		const storage = authStorage;
+		const credentialStore = store;
+		if (!storage || !credentialStore) throw new Error("test setup failed");
+		await storage.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		const sessionId = "reload-reorder-session";
+		const target = storage.listOAuthAccounts(PROVIDER, sessionId).find(account => account.email === "b@example.com");
+		if (!target) throw new Error("expected account b");
+		expect(storage.pinSessionOAuthAccount(PROVIDER, sessionId, target.credentialId)).toBe(true);
+
+		// Remove "a" (the earlier-index sibling) directly through the
+		// underlying store, bypassing every AuthStorage-level mutation method
+		// (set/removeCredential/disable all call `#resetProviderAssignments`
+		// and would trivially avoid this bug) -- this is exactly the shape of
+		// an external process's write or a background auth-broker snapshot
+		// delivery, surfaced to THIS SAME live `AuthStorage` instance only
+		// through `reload()`, which intentionally does not reset assignments.
+		// "b" was recorded at index 1; after removing "a" it moves to index 0,
+		// with "c" sliding into the old index 1 -- an index-only sticky would
+		// now silently point at "c".
+		const rowA = credentialStore
+			.listAuthCredentials(PROVIDER)
+			.find(row => row.credential.type === "oauth" && row.credential.email === "a@example.com");
+		if (!rowA) throw new Error("expected row a");
+		credentialStore.deleteAuthCredential(rowA.id, "test: simulate external removal");
+		await storage.reload();
+
+		const accountsAfter = storage.listOAuthAccounts(PROVIDER, sessionId);
+		expect(accountsAfter.map(account => account.email)).toEqual(["b@example.com", "c@example.com"]);
+		expect(accountsAfter.find(account => account.active)?.email).toBe("b@example.com");
+		expect(storage.getOAuthAccountIdentity(PROVIDER, sessionId)?.email).toBe("b@example.com");
 	});
 
 	test("getOAuthAccessAt resolves the credential at the requested position and touches only that one", async () => {

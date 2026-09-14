@@ -1358,7 +1358,15 @@ export class AuthStorage {
 	#configOverrides: Map<string, string> = new Map();
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
 	#providerRoundRobinIndex: Map<string, number> = new Map();
-	/** Tracks the last used credential per provider for a session (used for rate-limit switching). */
+	/**
+	 * Tracks the last used credential per provider for a session (used for
+	 * rate-limit switching). `index` is a snapshot into `#getStoredCredentials`
+	 * at record time and can go stale the moment that array is reordered or
+	 * shrinks (a broker snapshot delivery, `/logout` of a sibling, credential
+	 * replacement) — `credentialId` is the durable key `#getSessionCredential`
+	 * re-resolves `index` against on every read so a stale in-memory entry
+	 * never silently repoints at whatever now occupies the old slot.
+	 */
 	#sessionLastCredential: Map<
 		string,
 		Map<string, { type: AuthCredential["type"]; index: number; credentialId?: number; lastUsedAtMs?: number }>
@@ -2109,6 +2117,28 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Re-derive a session-sticky's current array index from its durable
+	 * credential id against the live stored-credential array. That array can
+	 * be reordered or shrink between when a sticky was recorded and when it's
+	 * read (a broker snapshot delivery, `/logout` of a sibling, credential
+	 * replacement) — trusting a stale `index` on its own silently repoints
+	 * the sticky at whatever credential now occupies that slot instead of the
+	 * one that was actually pinned. Returns `undefined` when the credential no
+	 * longer exists (of the expected type), meaning the sticky itself is
+	 * stale and must not be trusted.
+	 */
+	#reconcileSessionCredentialIndex(
+		provider: string,
+		type: AuthCredential["type"],
+		credentialId: number,
+	): number | undefined {
+		const stored = this.#getStoredCredentials(provider);
+		const actualIndex = stored.findIndex(entry => entry.id === credentialId);
+		if (actualIndex === -1 || stored[actualIndex]?.credential.type !== type) return undefined;
+		return actualIndex;
+	}
+
+	/**
 	 * Records which credential was used for a session (for rate-limit switching).
 	 * `lastUsedAtMs` backdates the sticky (session-file pin restores on resume);
 	 * it defaults to now for live selections.
@@ -2127,46 +2157,41 @@ export class AuthStorage {
 		sessionMap.set(sessionId, { type, index, credentialId, lastUsedAtMs: nowMs });
 		this.#sessionLastCredential.set(provider, sessionMap);
 
+		if (credentialId === undefined) return;
 		try {
-			if (credentialId !== undefined) {
-				const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
-				const cacheValue = JSON.stringify({
-					type,
-					index,
-					credentialId,
-					lastUsedAtMs: nowMs,
-				});
-				// Expires in 30 days
-				const expiresAtSec = Math.floor(nowMs / 1000) + 30 * 24 * 60 * 60;
-				this.#store.setCache(cacheKey, cacheValue, expiresAtSec);
-			}
+			const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
+			const cacheValue = JSON.stringify({ type, index, credentialId, lastUsedAtMs: nowMs });
+			// Expires in 30 days
+			const expiresAtSec = Math.floor(nowMs / 1000) + 30 * 24 * 60 * 60;
+			this.#store.setCache(cacheKey, cacheValue, expiresAtSec);
 		} catch (err) {
 			logger.debug("Failed to write session sticky credential to persistent store cache", { err });
 		}
 	}
 
-	/** Retrieves the last credential used by a session. */
+	/**
+	 * Retrieves the last credential used by a session. Both the in-memory fast
+	 * path and the persisted-cache fallback reconcile `index` against the
+	 * sticky's durable `credentialId` on every call — never trust a
+	 * previously recorded `index` as-is, see
+	 * {@link AuthStorage.#reconcileSessionCredentialIndex}.
+	 */
 	#getSessionCredential(
 		provider: string,
 		sessionId: string | undefined,
 	): { type: AuthCredential["type"]; index: number; credentialId?: number; lastUsedAtMs?: number } | undefined {
 		if (!sessionId) return undefined;
 		let sessionMap = this.#sessionLastCredential.get(provider);
-		const live = sessionMap?.get(sessionId);
-		if (live) {
-			// Another process can add or drop rows mid-session and the pool is an
-			// index-ordered snapshot, so re-resolve the pin through its durable row
-			// id: a compacted array must not point the session at a different
-			// account, and a deleted account must not hand its slot to a sibling.
-			if (live.credentialId === undefined) return live;
-			const stored = this.#getStoredCredentials(provider);
-			const actualIndex = stored.findIndex(entry => entry.id === live.credentialId);
-			if (actualIndex === -1 || stored[actualIndex]?.credential.type !== live.type) {
+		const cached = sessionMap?.get(sessionId);
+		if (cached) {
+			if (cached.credentialId === undefined) return cached;
+			const actualIndex = this.#reconcileSessionCredentialIndex(provider, cached.type, cached.credentialId);
+			if (actualIndex === undefined) {
 				sessionMap?.delete(sessionId);
 				return undefined;
 			}
-			live.index = actualIndex;
-			return live;
+			if (actualIndex !== cached.index) sessionMap?.set(sessionId, { ...cached, index: actualIndex });
+			return { type: cached.type, index: actualIndex, lastUsedAtMs: cached.lastUsedAtMs };
 		}
 		try {
 			const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
@@ -2179,19 +2204,17 @@ export class AuthStorage {
 					lastUsedAtMs?: number;
 				};
 
-				if (val.credentialId !== undefined) {
-					const stored = this.#getStoredCredentials(provider);
-					const actualIndex = stored.findIndex(entry => entry.id === val.credentialId);
-					if (actualIndex === -1 || stored[actualIndex]?.credential.type !== val.type) {
-						this.#store.setCache(cacheKey, "", 0);
-						return undefined;
-					}
-					val.index = actualIndex;
-				} else {
+				if (val.credentialId === undefined) {
 					// Fallback: drop unsafe index-only cache rows to prevent wrong-account routing
 					this.#store.setCache(cacheKey, "", 0);
 					return undefined;
 				}
+				const actualIndex = this.#reconcileSessionCredentialIndex(provider, val.type, val.credentialId);
+				if (actualIndex === undefined) {
+					this.#store.setCache(cacheKey, "", 0);
+					return undefined;
+				}
+				val.index = actualIndex;
 
 				if (!sessionMap) {
 					sessionMap = new Map();

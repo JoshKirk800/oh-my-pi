@@ -652,6 +652,19 @@ export class AgentSession {
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
 	readonly #advisors: SessionAdvisors;
+	/**
+	 * `${provider}\0${sessionId}` keys where `#applyStartupOAuthAccountPin` has
+	 * found nothing active AND no resolvable match yet — an open window where
+	 * a later `AuthStorage.onGenerationChanged` retry is allowed to override
+	 * whatever automatic ranking incidentally picks in the meantime (e.g. a
+	 * real request served off a stale broker snapshot before the configured
+	 * account became visible). Cleared the moment ANY account becomes active
+	 * for that key by ANY means — our own successful pin, a resumed manual
+	 * pin restored by `seedCredentialPins`, or a live `/session pin`
+	 * (`pinCurrentProviderOAuthAccount` clears it directly) — so the retry
+	 * can never clobber a deliberate choice, only a still-unresolved default.
+	 */
+	#pendingStartupOAuthPins = new Set<string>();
 	/** Resolves once the resume-time advisor spend backfill settles. */
 	#advisorCostRestore: Promise<void> = Promise.resolve();
 	#goalTurnCounter = 0;
@@ -1862,7 +1875,8 @@ export class AgentSession {
 				this.#recovery.noteRetryFallbackCooldown(selector, retryAfterMs, errorMessage),
 			createCodexCompactionContext: createMaintenanceCodexCompactionContext,
 			sessionId: () => this.sessionId,
-			applyStartupOAuthAccountPin: (provider, sessionId) => this.#applyStartupOAuthAccountPin(provider, sessionId),
+			applyStartupOAuthAccountPin: (provider, sessionId, options) =>
+				this.#applyStartupOAuthAccountPin(provider, sessionId, options),
 		};
 		this.#advisors = new SessionAdvisors(advisorsHost, {
 			enabled: this.settings.get("advisor.enabled"),
@@ -2047,11 +2061,13 @@ export class AgentSession {
 		// RemoteAuthCredentialStore can serve a cached snapshot while it
 		// refreshes in the background) or a sibling process logging in locally
 		// can both leave `#applyStartupOAuthAccountPin` with zero matches on its
-		// first call. Both call targets already no-op once an account is active
-		// for their session id, so retrying on every generation bump is safe and
-		// only ever affects the still-unpinned case.
+		// first call. `allowOverrideAutoSticky` lets this retry correct a sticky
+		// that ordinary ranking created in the meantime (a real request routed
+		// to a sibling account before the configured one became resolvable) --
+		// see `#pendingStartupOAuthPins` for why this can never override a
+		// resumed or deliberate manual pin.
 		this.#unsubscribeAuthStorageGeneration = this.#modelRegistry.authStorage.onGenerationChanged(() => {
-			this.#applyStartupOAuthAccountPin();
+			this.#applyStartupOAuthAccountPin(undefined, undefined, { allowOverrideAutoSticky: true });
 			this.#advisors.reapplyStartupOAuthAccountPins();
 		});
 
@@ -10650,10 +10666,15 @@ export class AgentSession {
 	/**
 	 * Pin a stored OAuth account to the current model provider for this session.
 	 * Returns false while streaming or when the credential is no longer available.
+	 * A deliberate manual pin always takes the account it names — clears
+	 * `#pendingStartupOAuthPins` for this (provider, session) so a later
+	 * `AuthStorage.onGenerationChanged` retry of the startup default can never
+	 * override it (see `#applyStartupOAuthAccountPin`'s `allowOverrideAutoSticky`).
 	 */
 	pinCurrentProviderOAuthAccount(credentialId: number): boolean {
 		const provider = this.model?.provider;
 		if (!provider || this.isStreaming) return false;
+		this.#pendingStartupOAuthPins.delete(`${provider}\0${this.sessionId}`);
 		return this.#modelRegistry.authStorage.pinSessionOAuthAccount(provider, this.sessionId, credentialId);
 	}
 
@@ -10673,39 +10694,66 @@ export class AgentSession {
 	 * `/fresh`, fork, rewind — also refreshes every live advisor), on a
 	 * `/model` switch that changes provider
 	 * (`#setModelWithProviderSessionReset`), on an advisor being (re)primed
-	 * (`SessionAdvisors#refreshAdvisorProviderIdentity`), and on every
-	 * `AuthStorage` generation change (`onGenerationChanged`, wired in the
-	 * constructor) to retry once a selector that matched nothing the first
-	 * time becomes resolvable — a stale auth-broker snapshot cache or a
-	 * sibling process's `/login` can both make the configured account appear
-	 * only after this method's first call for a given session id.
+	 * (`SessionAdvisors#refreshAdvisorProviderIdentity`), and — with
+	 * `options.allowOverrideAutoSticky` — on every `AuthStorage` generation
+	 * change (`onGenerationChanged`, wired in the constructor) to retry once a
+	 * selector that matched nothing the first time becomes resolvable.
 	 *
 	 * Selector syntax matches `/session pin`: 1-based stored-account position,
 	 * email, account id, org id, org name, or `OAuth credential #<id>`
-	 * (case-insensitive). No-ops when unconfigured, when the configured value
-	 * isn't a string (a hand-edited YAML/JSON record can hold any value type —
-	 * e.g. an unquoted numeric position — so this must not assume `string` and
-	 * call `.trim()` on it), when a session pin already exists for this
-	 * provider (e.g. resuming a session that pinned one earlier, or an earlier
-	 * provider switch in this same session — never overrides a later manual
-	 * `/session pin`), or when the selector is missing/ambiguous. This only
-	 * decides which account this session's active provider starts from; normal
-	 * usage-based ranking still fails over to a sibling account when the
-	 * pinned one is rate-limited (see {@link AuthStorage.pinSessionOAuthAccount}).
+	 * (case-insensitive). No-ops when unconfigured, or when the configured
+	 * value isn't a string (a hand-edited YAML/JSON record can hold any value
+	 * type — e.g. an unquoted numeric position — so this must not assume
+	 * `string` and call `.trim()` on it).
+	 *
+	 * Never overrides an account that is ALREADY active for this
+	 * `(provider, sessionId)` UNLESS `options.allowOverrideAutoSticky` is set
+	 * AND this exact pair is still in `#pendingStartupOAuthPins` — i.e. every
+	 * ordinary lifecycle call up to now found nothing active and nothing to
+	 * match. That pending flag is the only signal distinguishing "still
+	 * unresolved, whatever became active in the meantime was automatic
+	 * ranking's incidental pick" from "already settled" (a resumed manual pin
+	 * restored by `seedCredentialPins`, an earlier successful application of
+	 * this same selector, or a later deliberate `/session pin` —
+	 * `pinCurrentProviderOAuthAccount` clears the flag directly so a live
+	 * manual pin can never be clobbered by a subsequent retry). A stale
+	 * auth-broker snapshot cache or a sibling process's `/login` can both make
+	 * the configured account visible only after this method's first call for
+	 * a given session id, and a real request can route to a sibling account
+	 * via ordinary ranking in that same window — `allowOverrideAutoSticky`
+	 * lets the retry correct that once the account it was actually configured
+	 * to reserve becomes resolvable, without ever touching a deliberate
+	 * choice. This only decides which account this session's active provider
+	 * starts from; normal usage-based ranking still fails over to a sibling
+	 * account when the pinned one is rate-limited (see
+	 * {@link AuthStorage.pinSessionOAuthAccount}).
 	 */
-	#applyStartupOAuthAccountPin(provider = this.model?.provider, sessionId = this.sessionId): void {
+	#applyStartupOAuthAccountPin(
+		provider = this.model?.provider,
+		sessionId = this.sessionId,
+		options?: { allowOverrideAutoSticky?: boolean },
+	): void {
 		if (!provider) return;
 		const configuredValue = (this.settings.get("auth.startupOAuthAccount") as Record<string, unknown> | undefined)?.[
 			provider
 		];
 		const selector = typeof configuredValue === "string" ? configuredValue.trim() : undefined;
 		if (!selector) return;
+		const key = `${provider}\0${sessionId}`;
 		const authStorage = this.#modelRegistry.authStorage;
 		const accounts = authStorage.listOAuthAccounts(provider, sessionId);
-		if (accounts.some(account => account.active)) return;
+		const hasActive = accounts.some(account => account.active);
+		if (hasActive && !(options?.allowOverrideAutoSticky && this.#pendingStartupOAuthPins.has(key))) {
+			this.#pendingStartupOAuthPins.delete(key);
+			return;
+		}
 		const matches = matchOAuthAccountsBySelector(accounts, selector);
-		if (matches.length !== 1) return;
+		if (matches.length !== 1) {
+			if (!hasActive) this.#pendingStartupOAuthPins.add(key);
+			return;
+		}
 		authStorage.pinSessionOAuthAccount(provider, sessionId, matches[0].credentialId);
+		this.#pendingStartupOAuthPins.delete(key);
 	}
 
 	/**
