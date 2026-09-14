@@ -107,6 +107,20 @@ export async function runAuthCommand(cmd: AuthCommandArgs): Promise<void> {
 
 	const authStorage = await discoverAuthStorage();
 	try {
+		// A short-lived CLI process only ever calls this once: under a broker,
+		// `discoverAuthStorage()` deliberately serves a possibly-stale on-disk
+		// snapshot cache while it refreshes in the background (see
+		// `packages/ai/src/auth-broker/discover.ts`), and there is no time left
+		// in this process for that background delivery to land. Force a live
+		// fetch (a no-op for the local SQLite store) so a just-added or
+		// just-removed account is visible to `accounts`/`pin` immediately
+		// instead of only after the cache's TTL expires. Best-effort: a slow or
+		// unreachable broker falls back to the cached view rather than failing
+		// the whole command, matching how `RemoteAuthCredentialStore` itself
+		// treats a post-write refresh as fire-and-forget.
+		await authStorage.revalidateCredentials().catch(error => {
+			console.error(chalk.dim(`Could not refresh accounts from the auth broker; showing the cached list: ${error}`));
+		});
 		const accounts = authStorage.listOAuthAccounts(provider);
 		if (accounts.length === 0) {
 			console.error(chalk.red(`No stored OAuth accounts for "${provider}". Use /login to add one.`));

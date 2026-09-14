@@ -339,6 +339,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#generation = generation;
 		this.#snapshotReceivedAt = nowMs;
 		this.#refreshCredentialRevision();
+		// Notify with the RAW wire snapshot (not `this.#snapshot`, which is
+		// account-pool-filtered and block-normalized) -- `discover.ts`'s
+		// `persist` callback writes this verbatim to the on-disk cache read
+		// back as `initialSnapshot` on the next process start.
 		const onSnapshot = this.#onSnapshot;
 		if (!onSnapshot) return;
 		try {
@@ -589,6 +593,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#generation = generation;
 		this.#snapshotReceivedAt = Date.now();
 		this.#refreshCredentialRevision();
+		this.#notifySnapshot();
 	}
 
 	#removeStreamCredential(
@@ -606,6 +611,26 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#generation = generation;
 		this.#snapshotReceivedAt = Date.now();
 		this.#refreshCredentialRevision();
+		this.#notifySnapshot();
+	}
+
+	/**
+	 * Fires `onSnapshot` for an incremental delta (`entry`/`removed` stream
+	 * frames), which mutate `#snapshot`/`#generation` directly instead of
+	 * going through `#applySnapshot`. Without this, a caller wired to
+	 * `onSnapshot` to refresh a downstream cache (e.g. `AuthStorage.reload()`
+	 * in `discover.ts`) only ever sees the FIRST full snapshot after the SSE
+	 * connection opens — every subsequent single-credential update on that
+	 * same long-lived connection would be invisible to it.
+	 */
+	#notifySnapshot(): void {
+		const onSnapshot = this.#onSnapshot;
+		if (!onSnapshot) return;
+		try {
+			onSnapshot(this.#snapshot, this.#generation);
+		} catch (error) {
+			logger.debug("auth-broker snapshot callback failed", { error: String(error) });
+		}
 	}
 
 	/** Re-hydrate the in-memory snapshot from the broker. */

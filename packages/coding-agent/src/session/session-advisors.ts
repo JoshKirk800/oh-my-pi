@@ -1603,6 +1603,8 @@ export class SessionAdvisors {
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		if (!primaryModel || !this.#canReplayAdvisorHistory(advisor, primaryModel)) return;
+		if (advisor.providerSessionId)
+			this.#host.applyStartupOAuthAccountPin(primaryModel.provider, advisor.providerSessionId);
 		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, advisor.providerSessionId, { signal });
 		if (!apiKey) return;
 		signal.throwIfAborted();
@@ -1745,6 +1747,8 @@ export class SessionAdvisors {
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 				if (!candidate || modelsAreEqual(candidate, currentModel)) continue;
 				if (!this.#canReplayAdvisorHistory(advisor, candidate)) continue;
+				if (advisor.providerSessionId)
+					this.#host.applyStartupOAuthAccountPin(candidate.provider, advisor.providerSessionId);
 				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, { signal });
 				if (!apiKey) continue;
 				signal.throwIfAborted();

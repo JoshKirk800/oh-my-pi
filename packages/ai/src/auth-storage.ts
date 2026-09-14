@@ -1727,6 +1727,38 @@ export class AuthStorage {
 	#setStoredCredentials(provider: string, credentials: StoredCredential[]): void {
 		const current = this.#data.get(provider) ?? [];
 		if (storedCredentialArraysEqual(current, credentials)) return;
+		// Every EXPLICIT mutation (set/removeCredential/disable/replace) already
+		// calls `#resetProviderAssignments()` right after this method runs,
+		// which purges the index-keyed backoff/probe maps below. `reload()` is
+		// the one path that funnels here WITHOUT that follow-up call, by design
+		// (a routine external-change poll should not also reset round-robin
+		// state on every no-op sync) — but an external process reordering or
+		// removing a credential (a broker snapshot delivery, a sibling
+		// `/logout`) still shifts every LATER credential's array index, and
+		// these maps key temporary rate-limit backoff by that index. Left
+		// stale, index N's block silently reapplies to whatever credential now
+		// sits at index N, either wrongly blocking an available account or
+		// wrongly clearing a block on one still rate-limited. Detect an
+		// id-ORDER change specifically (not just content, which the equality
+		// check above already handled) and purge just these index-keyed maps —
+		// session stickies use a separate, more precise durable-id
+		// reconciliation (see `#reconcileSessionCredentialIndex`) instead of a
+		// blanket clear, since losing a sticky account mid-session is far more
+		// disruptive than losing a temporary backoff window.
+		const idOrderChanged =
+			current.length !== credentials.length || current.some((entry, index) => entry.id !== credentials[index]?.id);
+		if (idOrderChanged) {
+			const scopedPrefix = `${provider}:`;
+			for (const key of this.#credentialBackoff.keys()) {
+				if (key === provider || key.startsWith(scopedPrefix)) this.#credentialBackoff.delete(key);
+			}
+			for (const key of this.#credentialBackoffProviderTimed.keys()) {
+				if (key === provider || key.startsWith(scopedPrefix)) this.#credentialBackoffProviderTimed.delete(key);
+			}
+			for (const key of this.#credentialBackoffProbeAfter.keys()) {
+				if (key === provider || key.startsWith(scopedPrefix)) this.#credentialBackoffProbeAfter.delete(key);
+			}
+		}
 		const trackedBearerFingerprints = this.#oauthBearerFingerprints.get(provider);
 		if (trackedBearerFingerprints) {
 			const activeOAuthIds = new Set(

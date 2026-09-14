@@ -511,22 +511,34 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			});
 			try {
 				expect(discovered.listOAuthAccounts("anthropic").map(account => account.email)).toEqual(["a@example.com"]);
+
+				// Warm up the SSE connection first: the very first server-side event
+				// after a fresh connection is always a full "snapshot" frame (see
+				// server.ts's one-time `initialEvent` write on connect), which is
+				// already covered by `#applySnapshot`'s own `onSnapshot` wiring.
+				// Only once that frame has landed is a LATER server-side change
+				// guaranteed to arrive as an incremental "entry" delta instead
+				// (`RemoteAuthCredentialStore#applyStreamEntry`), which mutates the
+				// store directly and previously never reached `onSnapshot` at all.
+				storage!.upsertCredential("anthropic", mintOAuthCredential("warmup", Date.now() + 120_000));
+				await waitUntil(() => discovered.listOAuthAccounts("anthropic").length === 2);
+
 				const initialGeneration = discovered.getGeneration();
 				let observedGeneration: number | undefined;
 				const unsubscribe = discovered.onGenerationChanged(generation => {
 					observedGeneration = generation;
 				});
 				try {
-					// Server-side upsert reaches this client over the background SSE
-					// stream. This test never calls `discovered.reload()` itself --
-					// the assertions below only pass if `discoverAuthStorage`'s
-					// `onSnapshot` wiring (packages/ai/src/auth-broker/discover.ts)
-					// reloads on its own, which is what lets an
-					// `AuthStorage.onGenerationChanged` subscriber (e.g.
-					// `AgentSession#applyStartupOAuthAccountPin`'s retry) notice a
-					// credential that appeared after this store was first read.
+					// On an established stream, this upsert MUST arrive as an "entry"
+					// delta frame. This test never calls `discovered.reload()` itself
+					// -- the assertions below only pass if `RemoteAuthCredentialStore`'s
+					// delta handlers also notify `onSnapshot` (packages/ai/src/auth-broker/remote-store.ts),
+					// which is what lets `discoverAuthStorage`'s `onSnapshot` wiring
+					// (packages/ai/src/auth-broker/discover.ts) reload `AuthStorage` and
+					// bump its generation for an `onGenerationChanged` subscriber (e.g.
+					// `AgentSession#applyStartupOAuthAccountPin`'s retry) to notice.
 					storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
-					await waitUntil(() => discovered.listOAuthAccounts("anthropic").length === 2);
+					await waitUntil(() => discovered.listOAuthAccounts("anthropic").length === 3);
 					expect(discovered.getGeneration()).toBeGreaterThan(initialGeneration);
 					expect(observedGeneration).toBeGreaterThan(initialGeneration);
 				} finally {
