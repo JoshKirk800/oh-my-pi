@@ -503,6 +503,41 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		);
 	});
 
+	test("discoverAuthStorage reflects a background snapshot delivery and bumps its own generation without an explicit reload", async () => {
+		await withEnv({ OMP_AUTH_BROKER_URL: handle!.url, OMP_AUTH_BROKER_TOKEN: token }, async () => {
+			const discovered = await discoverAuthStorage({
+				agentDir: tempDir,
+				cachePath: path.join(tempDir, "generation-snapshot-cache.enc"),
+			});
+			try {
+				expect(discovered.listOAuthAccounts("anthropic").map(account => account.email)).toEqual(["a@example.com"]);
+				const initialGeneration = discovered.getGeneration();
+				let observedGeneration: number | undefined;
+				const unsubscribe = discovered.onGenerationChanged(generation => {
+					observedGeneration = generation;
+				});
+				try {
+					// Server-side upsert reaches this client over the background SSE
+					// stream. This test never calls `discovered.reload()` itself --
+					// the assertions below only pass if `discoverAuthStorage`'s
+					// `onSnapshot` wiring (packages/ai/src/auth-broker/discover.ts)
+					// reloads on its own, which is what lets an
+					// `AuthStorage.onGenerationChanged` subscriber (e.g.
+					// `AgentSession#applyStartupOAuthAccountPin`'s retry) notice a
+					// credential that appeared after this store was first read.
+					storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+					await waitUntil(() => discovered.listOAuthAccounts("anthropic").length === 2);
+					expect(discovered.getGeneration()).toBeGreaterThan(initialGeneration);
+					expect(observedGeneration).toBeGreaterThan(initialGeneration);
+				} finally {
+					unsubscribe();
+				}
+			} finally {
+				discovered.close();
+			}
+		});
+	});
+
 	test("prefers a programmatic SDK account pool over the environment file", async () => {
 		await withEnv(
 			{

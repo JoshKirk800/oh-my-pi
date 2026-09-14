@@ -287,13 +287,36 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 		// the current generation within one RTT without blocking startup on a
 		// broker round trip. A token revoked since the cache was written surfaces
 		// through that background path exactly like a mid-session revocation.
+		//
+		// `storage` is assigned right after construction below and read back
+		// inside this closure on every later delivery (initial delivery races
+		// harmlessly with that assignment — `store`'s own constructor call to
+		// `#applySnapshot` runs synchronously before `RemoteAuthCredentialStore`
+		// returns, i.e. before `storage` exists, and the `reload()` right after
+		// construction already covers that first snapshot).
+		// oxlint-disable-next-line prefer-const -- captured by the onSnapshot closure before assignment
+		let storage: AuthStorage | undefined;
 		const store = new RemoteAuthCredentialStore({
 			client,
 			initialSnapshot,
-			onSnapshot: persist,
+			onSnapshot: snapshot => {
+				persist?.(snapshot);
+				// A background delivery landing after this process' AuthStorage
+				// cache was last read (e.g. serving a stale-but-valid on-disk
+				// snapshot at startup while this refreshes underneath it, or a
+				// mid-session credential change on another process/device) must
+				// bump AuthStorage's own generation so callers holding an
+				// `onGenerationChanged` subscription — such as
+				// `AgentSession#applyStartupOAuthAccountPin`'s retry, which can
+				// have matched zero accounts against the earlier snapshot — get a
+				// chance to re-resolve. `store.listAuthCredentials()` already
+				// reads this delivery's data live; `reload()` is what makes
+				// `AuthStorage`'s cached view (and generation counter) catch up.
+				void storage?.reload();
+			},
 			accountPool,
 		});
-		const storage = new AuthStorage(store, {
+		storage = new AuthStorage(store, {
 			configValueResolver: options.configValueResolver,
 			sourceLabel: options.sourceLabel ?? `broker ${brokerConfig.url}`,
 		});

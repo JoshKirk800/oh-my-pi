@@ -31,10 +31,16 @@ if (!openaiModel) throw new Error("expected a bundled openai model for this test
 const cleanup: Array<() => Promise<void> | void> = [];
 
 /** Two Anthropic OAuth accounts under one settings-configured `startupOAuthAccount` default (account "a"). */
-async function createHarness(): Promise<{ session: AgentSession; sessionManager: SessionManager }> {
+async function createHarness(): Promise<{
+	session: AgentSession;
+	sessionManager: SessionManager;
+	authStorage: AuthStorage;
+	dbPath: string;
+}> {
 	const tempDir = TempDir.createSync("@pi-startup-oauth-pin-");
 	const cwd = tempDir.path();
-	const store = new SqliteAuthCredentialStore(new Database(path.join(cwd, "auth.db")));
+	const dbPath = path.join(cwd, "auth.db");
+	const store = new SqliteAuthCredentialStore(new Database(dbPath));
 	store.saveOAuth("anthropic", mintOAuthCredential("a"));
 	store.saveOAuth("anthropic", mintOAuthCredential("b"));
 	const authStorage = new AuthStorage(store);
@@ -51,7 +57,7 @@ async function createHarness(): Promise<{ session: AgentSession; sessionManager:
 		authStorage.close();
 		tempDir.removeSync();
 	});
-	return { session, sessionManager };
+	return { session, sessionManager, authStorage, dbPath };
 }
 
 describe("AgentSession startup OAuth account pin", () => {
@@ -193,6 +199,72 @@ describe("AgentSession startup OAuth account pin", () => {
 
 		const openaiAccounts = authStorage.listOAuthAccounts("openai", session.sessionId);
 		expect(openaiAccounts.find(a => a.active)?.accountId).toBe("account-o");
+
+		await session.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+	});
+
+	it("propagates the startup pin to an enabled advisor's own provider-session id", async () => {
+		const { session, authStorage } = await createHarness();
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.toggleAdvisorEnabled();
+		const advisorAgent = session.getAdvisorAgent();
+		if (!advisorAgent) throw new Error("expected advisor agent to exist");
+
+		// Advisor provider-session ids are separate random UUIDs credential
+		// stickiness is keyed on (see `getOrCreateAdvisorProviderSessionId`) --
+		// without propagation the advisor would start on automatic ranking
+		// instead of the configured account, potentially consuming the sibling
+		// account the setting reserved for failover.
+		const advisorSessionId = advisorAgent.sessionId;
+		expect(advisorSessionId).toBeDefined();
+		expect(advisorSessionId).not.toBe(session.sessionId);
+		const advisorAccounts = authStorage.listOAuthAccounts("anthropic", advisorSessionId as string);
+		expect(advisorAccounts.find(a => a.active)?.accountId).toBe("account-a");
+	});
+
+	it("retries the startup pin — for the primary session and an enabled advisor — once a matching account appears after construction", async () => {
+		const tempDir = TempDir.createSync("@pi-startup-oauth-pin-retry-");
+		const cwd = tempDir.path();
+		const dbPath = path.join(cwd, "auth.db");
+		const store = new SqliteAuthCredentialStore(new Database(dbPath));
+		store.saveOAuth("anthropic", mintOAuthCredential("a"));
+		const authStorage = new AuthStorage(store);
+		await authStorage.reload();
+
+		// Selector for account "c", which does not exist yet: nothing to match
+		// at construction time, the exact shape of a stale auth-broker snapshot
+		// cache or a sibling process's `/login` not yet visible.
+		const settings = Settings.isolated({ "auth.startupOAuthAccount": { anthropic: "c@example.com" } });
+		const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"), { settings });
+		const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
+		const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.toggleAdvisorEnabled();
+		const advisorAgent = session.getAdvisorAgent();
+		if (!advisorAgent) throw new Error("expected advisor agent to exist");
+		const advisorSessionId = advisorAgent.sessionId as string;
+
+		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.some(a => a.active)).toBe(false);
+		expect(authStorage.listOAuthAccounts("anthropic", advisorSessionId).some(a => a.active)).toBe(false);
+
+		// The account becomes visible later — through a second store handle on
+		// the same db, mirroring how a sibling process's write or a broker
+		// snapshot delivery makes new rows visible to `AuthStorage.reload()`
+		// without this process having restarted.
+		const secondStore = new SqliteAuthCredentialStore(new Database(dbPath));
+		secondStore.saveOAuth("anthropic", mintOAuthCredential("c"));
+		secondStore.close();
+		await authStorage.reload();
+
+		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.find(a => a.active)?.accountId).toBe(
+			"account-c",
+		);
+		expect(authStorage.listOAuthAccounts("anthropic", advisorSessionId).find(a => a.active)?.accountId).toBe(
+			"account-c",
+		);
 
 		await session.dispose();
 		authStorage.close();

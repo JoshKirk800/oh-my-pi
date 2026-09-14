@@ -404,6 +404,13 @@ export interface SessionAdvisorsHost {
 		phase: CodexCompactionContext["phase"];
 	}): CodexCompactionContext;
 	sessionId(): string;
+	/**
+	 * Retry `AgentSession#applyStartupOAuthAccountPin` for an explicit
+	 * (provider, sessionId) pair — advisor provider-session ids are separate
+	 * random UUIDs credential stickiness is keyed on, so the primary
+	 * session's pin never covers them on its own.
+	 */
+	applyStartupOAuthAccountPin(provider: string, sessionId: string): void;
 }
 
 /**
@@ -701,6 +708,22 @@ export class SessionAdvisors {
 		for (const advisor of this.#advisors) this.#refreshAdvisorProviderIdentity(advisor);
 	}
 
+	/**
+	 * Retry the configured `auth.startupOAuthAccount` default for every live
+	 * advisor's own provider-session id, without touching prompt-cache keys,
+	 * metadata resolvers, or telemetry (unlike {@link refreshProviderIdentity}).
+	 * Called from `AgentSession`'s `AuthStorage.onGenerationChanged` listener:
+	 * a selector that matched nothing when an advisor's identity was first
+	 * primed (stale broker snapshot cache, a sibling process's `/login` not
+	 * yet visible) can become resolvable once new credentials appear.
+	 */
+	reapplyStartupOAuthAccountPins(): void {
+		for (const advisor of this.#advisors) {
+			if (advisor.providerSessionId)
+				this.#host.applyStartupOAuthAccountPin(advisor.model.provider, advisor.providerSessionId);
+		}
+	}
+
 	/** Re-primes advisor transcript views after an in-conversation history rewrite. */
 	resetAllRuntimes(reason?: string): void {
 		this.#resetAllAdvisorRuntimes(reason);
@@ -777,7 +800,12 @@ export class SessionAdvisors {
 		this.#advisorInterruptImmuneTurnStart = this.#advisorPrimaryTurnsCompleted + 1;
 	}
 
-	/** Rebind one advisor to the active primary conversation's provider identity. */
+	/**
+	 * Rebind one advisor to the active primary conversation's provider
+	 * identity, then retry the `auth.startupOAuthAccount` default for the
+	 * advisor's own provider — a separate credential-stickiness key from the
+	 * primary session id, so the primary's pin never covers it on its own.
+	 */
 	#refreshAdvisorProviderIdentity(advisor: ActiveAdvisor): void {
 		const primaryProviderSessionId = this.#host.sessionId();
 		const providerSessionId = getOrCreateAdvisorProviderSessionId(
@@ -787,6 +815,7 @@ export class SessionAdvisors {
 		);
 		advisor.providerSessionId = providerSessionId;
 		advisor.agent.sessionId = providerSessionId;
+		if (providerSessionId) this.#host.applyStartupOAuthAccountPin(advisor.model.provider, providerSessionId);
 		advisor.agent.promptCacheKey = this.#host.agent.promptCacheKey ?? providerSessionId;
 		advisor.agent.getApiKey = requestModel => this.#host.modelRegistry.resolver(requestModel, providerSessionId);
 		advisor.agent.setMetadataResolver(

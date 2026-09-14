@@ -631,6 +631,7 @@ export class AgentSession {
 	#unsubscribeCodeMode?: () => void;
 	#unsubscribeEvalPreludeSettings?: () => void;
 	#unsubscribeIdleCloseSetting?: () => void;
+	#unsubscribeAuthStorageGeneration?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
@@ -1861,6 +1862,7 @@ export class AgentSession {
 				this.#recovery.noteRetryFallbackCooldown(selector, retryAfterMs, errorMessage),
 			createCodexCompactionContext: createMaintenanceCodexCompactionContext,
 			sessionId: () => this.sessionId,
+			applyStartupOAuthAccountPin: (provider, sessionId) => this.#applyStartupOAuthAccountPin(provider, sessionId),
 		};
 		this.#advisors = new SessionAdvisors(advisorsHost, {
 			enabled: this.settings.get("advisor.enabled"),
@@ -2038,6 +2040,19 @@ export class AgentSession {
 			void this.#tools.reconcileCodeMode().catch(error => {
 				logger.warn("Code Mode reconcile after setting change failed", { error: String(error) });
 			});
+		});
+		// Retry the configured startup default whenever new credentials become
+		// visible after this session's provider identity was already primed:
+		// resolving against a stale auth-broker snapshot cache (packages/ai's
+		// RemoteAuthCredentialStore can serve a cached snapshot while it
+		// refreshes in the background) or a sibling process logging in locally
+		// can both leave `#applyStartupOAuthAccountPin` with zero matches on its
+		// first call. Both call targets already no-op once an account is active
+		// for their session id, so retrying on every generation bump is safe and
+		// only ever affects the still-unpinned case.
+		this.#unsubscribeAuthStorageGeneration = this.#modelRegistry.authStorage.onGenerationChanged(() => {
+			this.#applyStartupOAuthAccountPin();
+			this.#advisors.reapplyStartupOAuthAccountPins();
 		});
 
 		// Config-declared resolution done against the catalog as it stands at
@@ -4930,6 +4945,10 @@ export class AgentSession {
 		if (this.#unsubscribeIdleCloseSetting) {
 			this.#unsubscribeIdleCloseSetting();
 			this.#unsubscribeIdleCloseSetting = undefined;
+		}
+		if (this.#unsubscribeAuthStorageGeneration) {
+			this.#unsubscribeAuthStorageGeneration();
+			this.#unsubscribeAuthStorageGeneration = undefined;
 		}
 		this.#eventListeners = [];
 		this.#runStateListeners.clear();
@@ -10639,11 +10658,28 @@ export class AgentSession {
 	}
 
 	/**
-	 * Auto-pin this session's OAuth account for the active model's provider from
-	 * `auth.startupOAuthAccount`, run whenever this session's active provider is
-	 * (re)established: at construction, on every session-identity transition
-	 * (`#syncAgentSessionId`, e.g. `/new`, `/fresh`, fork, rewind), and on a
-	 * `/model` switch that changes provider (`#setModelWithProviderSessionReset`).
+	 * Auto-pin `sessionId`'s OAuth account for `provider` from
+	 * `auth.startupOAuthAccount`. Defaults to the primary session
+	 * (`this.model?.provider`/`this.sessionId`); called with explicit
+	 * arguments for advisor provider-session ids, which are separate random
+	 * UUIDs credential stickiness is keyed on (see
+	 * `SessionAdvisorsHost.applyStartupOAuthAccountPin` /
+	 * `SessionAdvisors#refreshAdvisorProviderIdentity` — an advisor otherwise
+	 * starts on automatic ranking and can consume the sibling account this
+	 * setting was configured to reserve).
+	 *
+	 * Run whenever a provider identity is (re)established: at construction, on
+	 * every session-identity transition (`#syncAgentSessionId`, e.g. `/new`,
+	 * `/fresh`, fork, rewind — also refreshes every live advisor), on a
+	 * `/model` switch that changes provider
+	 * (`#setModelWithProviderSessionReset`), on an advisor being (re)primed
+	 * (`SessionAdvisors#refreshAdvisorProviderIdentity`), and on every
+	 * `AuthStorage` generation change (`onGenerationChanged`, wired in the
+	 * constructor) to retry once a selector that matched nothing the first
+	 * time becomes resolvable — a stale auth-broker snapshot cache or a
+	 * sibling process's `/login` can both make the configured account appear
+	 * only after this method's first call for a given session id.
+	 *
 	 * Selector syntax matches `/session pin`: 1-based stored-account position,
 	 * email, account id, org id, org name, or `OAuth credential #<id>`
 	 * (case-insensitive). No-ops when unconfigured, when the configured value
@@ -10657,8 +10693,7 @@ export class AgentSession {
 	 * usage-based ranking still fails over to a sibling account when the
 	 * pinned one is rate-limited (see {@link AuthStorage.pinSessionOAuthAccount}).
 	 */
-	#applyStartupOAuthAccountPin(): void {
-		const provider = this.model?.provider;
+	#applyStartupOAuthAccountPin(provider = this.model?.provider, sessionId = this.sessionId): void {
 		if (!provider) return;
 		const configuredValue = (this.settings.get("auth.startupOAuthAccount") as Record<string, unknown> | undefined)?.[
 			provider
@@ -10666,11 +10701,11 @@ export class AgentSession {
 		const selector = typeof configuredValue === "string" ? configuredValue.trim() : undefined;
 		if (!selector) return;
 		const authStorage = this.#modelRegistry.authStorage;
-		const accounts = authStorage.listOAuthAccounts(provider, this.sessionId);
+		const accounts = authStorage.listOAuthAccounts(provider, sessionId);
 		if (accounts.some(account => account.active)) return;
 		const matches = matchOAuthAccountsBySelector(accounts, selector);
 		if (matches.length !== 1) return;
-		authStorage.pinSessionOAuthAccount(provider, this.sessionId, matches[0].credentialId);
+		authStorage.pinSessionOAuthAccount(provider, sessionId, matches[0].credentialId);
 	}
 
 	/**
