@@ -171,4 +171,36 @@ describe("omp auth (contract)", () => {
 		const output = logs.join("\n");
 		expect(output).toContain("shared@example.com (Org A) [pinned]");
 	});
+
+	it("keeps a solo account pinned after a same-email sibling is added later via /login", async () => {
+		// Seed exactly one Anthropic account and pin it by email while it is
+		// the only match — the exact snapshot a naive "unique at write time"
+		// implementation would persist the email for.
+		const store = new SqliteAuthCredentialStore(new Database(getAgentDbPath(agentDir.path())));
+		store.saveOAuth("anthropic", mintOAuthCredential("solo", { orgId: "org-a", orgName: "Org A" }));
+		store.close();
+
+		await runAuthCommand({ action: "pin", provider: "anthropic", selector: "solo@example.com" });
+		expect(errors).toEqual([]);
+		const globalRaw = Settings.instance.getGlobalSettings().auth as
+			| { startupOAuthAccount?: Record<string, string> }
+			| undefined;
+		// Persisted as the durable credential id, not the email that was only
+		// unique at pin time — see `uniqueStartupSelector`'s doc comment.
+		expect(globalRaw?.startupOAuthAccount?.anthropic).toBe("OAuth credential #1");
+
+		// Simulate the same person logging into a second org under the same
+		// email later via `/login` — a record that did not exist when the
+		// selector above was persisted. This is the future-arriving-data
+		// case (distinct from a collision already present at pin time).
+		const laterStore = new SqliteAuthCredentialStore(new Database(getAgentDbPath(agentDir.path())));
+		laterStore.saveOAuth("anthropic", mintOAuthCredential("solo", { orgId: "org-b", orgName: "Org B" }));
+		laterStore.close();
+
+		logs = [];
+		await runAuthCommand({ action: "accounts", provider: "anthropic" });
+		const output = logs.join("\n");
+		expect(output).toContain("solo@example.com (Org A) [pinned]");
+		expect(output).not.toContain("ambiguous");
+	});
 });

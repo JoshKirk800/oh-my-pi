@@ -36,22 +36,20 @@ function accountLabel(account: OAuthAccountSummary): string {
 }
 
 /**
- * A selector that resolves back to exactly `account` and only `account` among
- * `accounts` — so persisting it can't go ambiguous later if a sibling shares
- * the same email or account id under a different org (Anthropic/ChatGPT
- * multi-subscription: same email, two orgs). Falls back to the durable
- * `OAuth credential #<id>` form (already an accepted selector, see
- * `matchOAuthAccountsBySelector`) rather than the 1-based position: a stored
- * position shifts when an earlier account is removed via `/logout`, which
- * would silently repoint the pin at a different account instead of just
- * going stale.
+ * The durable selector for a pinned account: always the `OAuth credential
+ * #<id>` form (already an accepted selector, see
+ * `matchOAuthAccountsBySelector`) — never the account's email/account id or
+ * its 1-based position. Both alternatives can go stale from events that
+ * happen strictly AFTER this selector is persisted, not just ones already
+ * present at pin time: a position shifts when an earlier account is
+ * removed via `/logout`, and an email/account id that is unique right now
+ * stops being unique the moment a new account sharing it (e.g. the same
+ * person joining a second org) is added later via `/login`. The durable
+ * credential id is the only value invariant under both of those future
+ * events, so it is used unconditionally rather than only as a fallback for
+ * a collision that already exists today.
  */
-function uniqueStartupSelector(account: OAuthAccountSummary, accounts: readonly OAuthAccountSummary[]): string {
-	for (const candidate of [account.email, account.accountId]) {
-		if (candidate === undefined) continue;
-		const matches = matchOAuthAccountsBySelector(accounts, candidate);
-		if (matches.length === 1 && matches[0].credentialId === account.credentialId) return candidate;
-	}
+function uniqueStartupSelector(account: OAuthAccountSummary): string {
 	return `OAuth credential #${account.credentialId}`;
 }
 
@@ -159,7 +157,7 @@ export async function runAuthCommand(cmd: AuthCommandArgs): Promise<void> {
 		}
 
 		const account = matches[0];
-		const selector = uniqueStartupSelector(account, accounts);
+		const selector = uniqueStartupSelector(account);
 		const configured = globalStartupOAuthAccounts();
 		configured[provider] = selector;
 		settings.set("auth.startupOAuthAccount", configured);
