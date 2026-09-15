@@ -1762,13 +1762,12 @@ export class AuthStorage {
 	#setStoredCredentials(provider: string, credentials: StoredCredential[]): boolean {
 		const current = this.#data.get(provider) ?? [];
 		if (storedCredentialArraysEqual(current, credentials)) return false;
-		// Every EXPLICIT mutation (set/removeCredential/disable/replace) already
-		// calls `#resetProviderAssignments()` right after this method runs,
-		// which purges the index-keyed backoff/probe maps below. `reload()` is
-		// the one path that funnels here WITHOUT that follow-up call, by design
-		// (a routine external-change poll should not also reset round-robin
-		// state on every no-op sync) — but an external process reordering or
-		// removing a credential (a broker snapshot delivery, a sibling
+		// Explicit mutations use `#setStoredCredentialsAndResetAssignments`,
+		// which purges index-keyed state before publishing the generation
+		// notification. `reload()` is the one path that funnels here WITHOUT
+		// that assignment reset, by design (a routine external-change poll
+		// should not also reset round-robin state on every no-op sync). An
+		// external process reordering or removing a credential (a broker
 		// `/logout`) still shifts every LATER credential's array index, and
 		// these maps key temporary rate-limit backoff by that index. Left
 		// stale, index N's block silently reapplies to whatever credential now
@@ -2552,6 +2551,27 @@ export class AuthStorage {
 		}
 	}
 
+	/**
+	 * Replace a provider's cached credentials and invalidate every assignment
+	 * derived from their old order before notifying generation subscribers.
+	 * A generation listener may immediately pin a newly-added account; emitting
+	 * from `#setStoredCredentials` first would let the following reset erase
+	 * that fresh pin.
+	 */
+	#setStoredCredentialsAndResetAssignments(provider: string, credentials: StoredCredential[]): boolean {
+		const wasSuppressed = this.#suppressGenerationBump;
+		let changed = false;
+		this.#suppressGenerationBump = true;
+		try {
+			changed = this.#setStoredCredentials(provider, credentials);
+			this.#resetProviderAssignments(provider);
+		} finally {
+			this.#suppressGenerationBump = wasSuppressed;
+		}
+		if (changed && !wasSuppressed) this.#bumpGeneration("credentials");
+		return changed;
+	}
+
 	/** Updates credential at index in-place (used for OAuth token refresh) */
 	#replaceCredentialAt(provider: string, index: number, credential: AuthCredential): void {
 		const entries = this.#getStoredCredentials(provider);
@@ -2584,8 +2604,7 @@ export class AuthStorage {
 		const disabled = this.#store.tryDisableAuthCredentialIfMatches(target.id, serialized.data, disabledCause);
 		if (!disabled) return false;
 		const updated = entries.filter((_value, idx) => idx !== index);
-		this.#setStoredCredentials(provider, updated);
-		this.#resetProviderAssignments(provider);
+		this.#setStoredCredentialsAndResetAssignments(provider, updated);
 		this.#emitCredentialDisabled({ provider, disabledCause });
 		return true;
 	}
@@ -2696,14 +2715,13 @@ export class AuthStorage {
 		const stored = this.#store.replaceAuthCredentialsRemote
 			? await this.#store.replaceAuthCredentialsRemote(provider, deduped)
 			: this.#store.replaceAuthCredentialsForProvider(provider, deduped);
-		this.#setStoredCredentials(
+		this.#setStoredCredentialsAndResetAssignments(
 			provider,
 			stored.map(record => ({
 				id: record.id,
 				credential: record.credential,
 			})),
 		);
-		this.#resetProviderAssignments(provider);
 	}
 
 	/**
@@ -2884,7 +2902,7 @@ export class AuthStorage {
 							leasedCredentialId !== undefined ? { owner, nowMs: Date.now() } : undefined,
 						);
 						if (disabled) {
-							this.#setStoredCredentials(
+							this.#setStoredCredentialsAndResetAssignments(
 								provider,
 								rows
 									.filter(entry => entry.id !== row.id)
@@ -2893,7 +2911,6 @@ export class AuthStorage {
 										credential: entry.credential,
 									})),
 							);
-							this.#resetProviderAssignments(provider);
 							this.#emitCredentialDisabled({ provider, disabledCause });
 							return { credential: undefined, refreshed: false, removed: true };
 						}
@@ -2977,11 +2994,10 @@ export class AuthStorage {
 		const stored = this.#store.upsertAuthCredentialRemote
 			? await this.#store.upsertAuthCredentialRemote(provider, credential)
 			: this.#store.upsertAuthCredentialForProvider(provider, credential);
-		this.#setStoredCredentials(
+		this.#setStoredCredentialsAndResetAssignments(
 			provider,
 			stored.map(entry => ({ id: entry.id, credential: entry.credential })),
 		);
-		this.#resetProviderAssignments(provider);
 	}
 
 	/**
@@ -2993,8 +3009,7 @@ export class AuthStorage {
 		} else {
 			this.#store.deleteAuthCredentialsForProvider(provider, "deleted by user");
 		}
-		this.#setStoredCredentials(provider, []);
-		this.#resetProviderAssignments(provider);
+		this.#setStoredCredentialsAndResetAssignments(provider, []);
 	}
 
 	/**
@@ -3011,11 +3026,10 @@ export class AuthStorage {
 		} else {
 			this.#store.deleteAuthCredential(credentialId, "deleted by user");
 		}
-		this.#setStoredCredentials(
+		this.#setStoredCredentialsAndResetAssignments(
 			provider,
 			entries.filter((_entry, entryIndex) => entryIndex !== index),
 		);
-		this.#resetProviderAssignments(provider);
 		return true;
 	}
 
@@ -3305,11 +3319,10 @@ export class AuthStorage {
 			const stored = this.#store.upsertAuthCredentialRemote
 				? await this.#store.upsertAuthCredentialRemote(provider, newCredential)
 				: this.#store.upsertAuthCredentialForProvider(provider, newCredential);
-			this.#setStoredCredentials(
+			this.#setStoredCredentialsAndResetAssignments(
 				provider,
 				stored.map(entry => ({ id: entry.id, credential: entry.credential })),
 			);
-			this.#resetProviderAssignments(provider);
 			return { type: "api_key" };
 		}
 		// Stamp the interactive-login instant: providers with an absolute grant
@@ -7421,8 +7434,7 @@ export class AuthStorage {
 			if (index === -1) continue;
 			this.#store.deleteAuthCredential(id, disabledCause);
 			const next = entries.filter((_value, idx) => idx !== index);
-			this.#setStoredCredentials(provider, next);
-			this.#resetProviderAssignments(provider);
+			this.#setStoredCredentialsAndResetAssignments(provider, next);
 			this.#emitCredentialDisabled({ provider, disabledCause });
 			return true;
 		}
@@ -7440,11 +7452,10 @@ export class AuthStorage {
 	 */
 	upsertCredential(provider: string, credential: AuthCredential): AuthCredentialSnapshotEntry[] {
 		const stored = this.#store.upsertAuthCredentialForProvider(provider, credential);
-		this.#setStoredCredentials(
+		this.#setStoredCredentialsAndResetAssignments(
 			provider,
 			stored.map(entry => ({ id: entry.id, credential: entry.credential })),
 		);
-		this.#resetProviderAssignments(provider);
 		return stored.map(entry => {
 			const persisted = entry.credential;
 			const redacted: SnapshotCredential =

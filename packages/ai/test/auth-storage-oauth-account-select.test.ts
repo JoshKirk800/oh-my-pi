@@ -273,6 +273,33 @@ describe("AuthStorage OAuth account selection", () => {
 		expect(storage.listOAuthAccounts("unit-oauth-reload-other")).toHaveLength(1);
 	});
 
+	test("notifies after resetting assignments so a listener pin survives an upsert", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		await storage.set(PROVIDER, oauthCredential("a"));
+
+		const sessionId = "generation-listener-pin";
+		let listenerPins = 0;
+		const unsubscribe = storage.onGenerationChanged(() => {
+			const newlyAdded = storage
+				.listOAuthAccounts(PROVIDER, sessionId)
+				.find(account => account.accountId === "acc-b");
+			if (!newlyAdded) return;
+			listenerPins++;
+			expect(storage.pinSessionOAuthAccount(PROVIDER, sessionId, newlyAdded.credentialId)).toBe(true);
+		});
+		try {
+			// Models the live /login upsert: the listener represents
+			// AgentSession's pending startup-pin retry.
+			storage.upsertCredential(PROVIDER, oauthCredential("b"));
+		} finally {
+			unsubscribe();
+		}
+
+		expect(listenerPins).toBe(1);
+		expect(storage.listOAuthAccounts(PROVIDER, sessionId).find(account => account.active)?.accountId).toBe("acc-b");
+	});
+
 	test("getOAuthAccessAt fails the requested account without touching siblings", async () => {
 		const storage = authStorage;
 		if (!storage) throw new Error("test setup failed");
