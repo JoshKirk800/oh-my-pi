@@ -614,9 +614,11 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 				await waitUntil(() => discovered.listOAuthAccounts("anthropic").length === 2);
 
 				const releases: Array<() => void> = [];
-				const writeSpy = vi
-					.spyOn(snapshotCacheModule, "writeAuthBrokerSnapshotCache")
-					.mockImplementation(() => new Promise<void>(resolve => releases.push(resolve)));
+				const writeSpy = vi.spyOn(snapshotCacheModule, "writeAuthBrokerSnapshotCache").mockImplementation(() => {
+					const deferred = Promise.withResolvers<void>();
+					releases.push(deferred.resolve);
+					return deferred.promise;
+				});
 
 				// Two entry deltas in close succession: the second's write must
 				// not even be INVOKED until the first's write settles, regardless
