@@ -10699,12 +10699,17 @@ export class AgentSession {
 	 * `#pendingStartupOAuthPins` for this (provider, session) so a later
 	 * `AuthStorage.onGenerationChanged` retry of the startup default can never
 	 * override it (see `#applyStartupOAuthAccountPin`'s `allowOverrideAutoSticky`).
+	 * Persist it immediately as well: before the next assistant turn can record
+	 * routing normally, a `/login` or `/logout` may reset the in-memory sticky
+	 * and trigger that retry.
 	 */
 	pinCurrentProviderOAuthAccount(credentialId: number): boolean {
 		const provider = this.model?.provider;
 		if (!provider || this.isStreaming) return false;
 		this.#pendingStartupOAuthPins.delete(`${provider}\0${this.sessionId}`);
-		return this.#modelRegistry.authStorage.pinSessionOAuthAccount(provider, this.sessionId, credentialId);
+		const pinned = this.#modelRegistry.authStorage.pinSessionOAuthAccount(provider, this.sessionId, credentialId);
+		if (pinned) recordCredentialPin(this.#modelRegistry.authStorage, this.sessionManager, this.sessionId, provider);
+		return pinned;
 	}
 
 	/**

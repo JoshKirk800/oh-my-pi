@@ -411,6 +411,25 @@ describe("AgentSession startup OAuth account pin", () => {
 		);
 	});
 
+	it("preserves a manual pin when a credential mutation resets live assignments before a turn", async () => {
+		const { session, authStorage } = await createHarness();
+		const accountB = authStorage
+			.listOAuthAccounts("anthropic", session.sessionId)
+			.find(account => account.accountId === "account-b");
+		if (!accountB) throw new Error("expected account b");
+		expect(session.pinCurrentProviderOAuthAccount(accountB.credentialId)).toBe(true);
+
+		// `/login`/`/logout` clear per-provider assignments. Its generation
+		// listener immediately restores a recorded pin before considering the
+		// configured default, so the user-selected B must survive even though
+		// it has not served an assistant turn yet.
+		authStorage.upsertCredential("anthropic", mintOAuthCredential("c"));
+
+		expect(
+			(await session.listCurrentProviderOAuthAccounts())?.accounts.find(account => account.active)?.accountId,
+		).toBe("account-b");
+	});
+
 	it("a resumed session-file pin still wins when its account only becomes visible after the startup default's", async () => {
 		const tempDir = TempDir.createSync("@pi-startup-oauth-pin-resume-race-");
 		const cwd = tempDir.path();
