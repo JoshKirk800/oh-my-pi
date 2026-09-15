@@ -124,6 +124,55 @@ describe("AgentSession startup OAuth account pin", () => {
 		expect(accounts?.accounts.find(a => a.active)?.accountId).toBe("account-b");
 	});
 
+	it("falls back to the configured default once a resumed session-file pin's account is confirmably gone", async () => {
+		const tempDir = TempDir.createSync("@pi-startup-oauth-pin-resume-gone-");
+		const cwd = tempDir.path();
+		const store = new SqliteAuthCredentialStore(new Database(path.join(cwd, "auth.db")));
+		store.saveOAuth("anthropic", mintOAuthCredential("a"));
+		store.saveOAuth("anthropic", mintOAuthCredential("b"));
+		store.saveOAuth("anthropic", mintOAuthCredential("c"));
+		const authStorage = new AuthStorage(store);
+		await authStorage.reload();
+
+		const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		// Simulate a resumed session file recorded while account "b" served it,
+		// then "b" was removed via `/logout` in a different process/session
+		// before this one resumes -- `seedCredentialPins` can never match it
+		// again (see its own "gone (logged out)" no-op).
+		const hash = credentialPinHash("anthropic", { accountId: "account-b", email: "b@example.com" });
+		if (!hash) throw new Error("expected a pin hash");
+		sessionManager.appendCredentialPin("anthropic", hash);
+		const toRemove = authStorage.listOAuthAccounts("anthropic").find(a => a.accountId === "account-b");
+		if (!toRemove) throw new Error("expected account b to exist before removal");
+		expect(await authStorage.removeCredential("anthropic", toRemove.credentialId)).toBe(true);
+
+		const settings = Settings.isolated({ "auth.startupOAuthAccount": { anthropic: "a@example.com" } });
+		const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"), { settings });
+		const agent = new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [], model } });
+		const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		cleanup.push(async () => {
+			await session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		});
+
+		// The first check after construction only gets one "not yet visible"
+		// grace round (indistinguishable from a stale broker snapshot), so
+		// nothing is active yet.
+		expect((await session.listCurrentProviderOAuthAccounts())?.accounts.some(a => a.active)).toBe(false);
+
+		// An unrelated credential change bumps AuthStorage's generation and
+		// retries the pin. On this SECOND consecutive miss for account "b"'s
+		// hash, the recorded pin is confirmably gone -- unlike the
+		// unconditional guard this replaces, that must now let the configured
+		// default (account "a") claim the session instead of deferring
+		// forever.
+		store.saveOAuth("anthropic", mintOAuthCredential("d"));
+		await authStorage.reload();
+		const accounts = await session.listCurrentProviderOAuthAccounts();
+		expect(accounts?.accounts.find(a => a.active)?.accountId).toBe("account-a");
+	});
+
 	it("still fails over to the sibling account when the pinned one is rate-limited", async () => {
 		const { session } = await createHarness();
 		const authStorage = session.modelRegistry.authStorage;

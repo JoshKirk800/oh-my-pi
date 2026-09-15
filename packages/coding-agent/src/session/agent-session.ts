@@ -295,7 +295,7 @@ import {
 	shouldEvaluateCodexAutoRedeem,
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
-import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
+import { credentialPinHash, recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
 import {
 	collectPendingToolCalls,
@@ -665,6 +665,16 @@ export class AgentSession {
 	 * can never clobber a deliberate choice, only a still-unresolved default.
 	 */
 	#pendingStartupOAuthPins = new Set<string>();
+	/**
+	 * Keys (`provider\0sessionId`) whose resumed session-file pin has already
+	 * been given one deferred "not yet visible" check and STILL found no
+	 * matching account. A second consecutive miss — necessarily on a LATER,
+	 * generation-changed call, since nothing else re-invokes
+	 * `#applyStartupOAuthAccountPin` — means the credential view has had a
+	 * chance to become authoritative and the recorded account is confirmably
+	 * gone (deleted via `/logout`), not merely stale-broker-invisible.
+	 */
+	#resumedPinGraceGiven = new Set<string>();
 	/** Resolves once the resume-time advisor spend backfill settles. */
 	#advisorCostRestore: Promise<void> = Promise.resolve();
 	#goalTurnCounter = 0;
@@ -4630,6 +4640,7 @@ export class AgentSession {
 		// primary's `sid` and every advisor id derived from it); the retry only
 		// ever re-checks the current ids, so stale keys would just accumulate.
 		this.#pendingStartupOAuthPins.clear();
+		this.#resumedPinGraceGiven.clear();
 		// Restore the session's recorded provider accounts before the first
 		// request routes: sticky rows are process-local under a remote auth
 		// broker, and losing them re-ranks onto a different account, cold-missing
@@ -4983,6 +4994,7 @@ export class AgentSession {
 			this.#unsubscribeAuthStorageGeneration = undefined;
 		}
 		this.#pendingStartupOAuthPins.clear();
+		this.#resumedPinGraceGiven.clear();
 		this.#eventListeners = [];
 		this.#runStateListeners.clear();
 		this.#sessionChangeCallbacks.clear();
@@ -10757,26 +10769,45 @@ export class AgentSession {
 		const selector = typeof configuredValue === "string" ? configuredValue.trim() : undefined;
 		if (!selector) return;
 		const key = `${provider}\0${sessionId}`;
-		// A resumed session's own recorded account (`credential_pin` in the
-		// session file) always outranks the configured default for the primary
-		// session, whether or not `seedCredentialPins` could restore it yet: under
-		// a stale broker snapshot the recorded account can be invisible while the
-		// default's account resolves, and pinning the default here would make the
-		// later `seedCredentialPins` retry skip ("something is already active"),
-		// permanently inverting the documented precedence. Fresh provider sessions
-		// (`/fresh`) explicitly discard the recorded routing identity, matching
-		// `#syncAgentSessionId`'s own `seedCredentialPins` guard. Advisors never
-		// record session-file pins, so this only applies to the primary id.
-		if (
-			sessionId === this.sessionId &&
-			!this.#freshProviderSessionId &&
-			this.sessionManager.getCredentialPins().has(provider)
-		) {
-			this.#pendingStartupOAuthPins.delete(key);
-			return;
-		}
 		const authStorage = this.#modelRegistry.authStorage;
 		const accounts = authStorage.listOAuthAccounts(provider, sessionId);
+		// A resumed session's own recorded account (`credential_pin` in the
+		// session file) outranks the configured default for the primary
+		// session for as long as it could still resolve: under a stale broker
+		// snapshot the recorded account can be temporarily invisible while the
+		// default's account resolves, and pinning the default here would make
+		// the later `seedCredentialPins` retry skip ("something is already
+		// active"), permanently inverting the documented precedence. A single
+		// non-empty account list with no match is not proof of permanence on
+		// its own -- that's indistinguishable from a snapshot that just hasn't
+		// caught up yet -- so the FIRST miss only records
+		// `#resumedPinGraceGiven` and still defers. Only a SECOND consecutive
+		// miss (necessarily on a LATER call: nothing else re-invokes this
+		// method) means the credential view has had a chance to refresh and
+		// `seedCredentialPins` will never resolve it either (its own doc:
+		// no-op "when the account is gone (logged out)") -- from there,
+		// continuing to defer would suppress the configured default forever
+		// even after later `/logout`s make the deleted pin permanently
+		// unrecoverable. Fresh provider sessions (`/fresh`) explicitly discard
+		// the recorded routing identity, matching `#syncAgentSessionId`'s own
+		// `seedCredentialPins` guard. Advisors never record session-file pins,
+		// so this only applies to the primary id.
+		const resumedPin =
+			sessionId === this.sessionId ? this.sessionManager.getCredentialPins().get(provider) : undefined;
+		if (resumedPin && !this.#freshProviderSessionId) {
+			const stillMatches =
+				accounts.length === 0 || accounts.some(account => credentialPinHash(provider, account) === resumedPin.hash);
+			if (stillMatches) {
+				this.#pendingStartupOAuthPins.delete(key);
+				this.#resumedPinGraceGiven.delete(key);
+				return;
+			}
+			if (!this.#resumedPinGraceGiven.has(key)) {
+				this.#resumedPinGraceGiven.add(key);
+				return;
+			}
+			this.#resumedPinGraceGiven.delete(key);
+		}
 		const hasActive = accounts.some(account => account.active);
 		if (hasActive && !(options?.allowOverrideAutoSticky && this.#pendingStartupOAuthPins.has(key))) {
 			this.#pendingStartupOAuthPins.delete(key);

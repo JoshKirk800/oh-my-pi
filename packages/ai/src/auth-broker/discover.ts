@@ -241,17 +241,29 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 		const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 		const cachePath = options.cachePath ?? getAuthBrokerSnapshotCachePath();
 		const ttlMs = resolveSnapshotTtlMs();
+		// Chained so concurrent onSnapshot deliveries (e.g. two SSE deltas
+		// arriving close together) persist in call order rather than
+		// completion order -- each write's encrypt/open/write/rename is async,
+		// so an older snapshot's write can otherwise finish and rename after a
+		// newer one, leaving a stale cache on disk. The delta dispatch already
+		// drops out-of-order events before invoking this callback (`if
+		// (event.generation < this.#generation) return;`), so call order here
+		// already matches generation order -- serializing is sufficient,
+		// no explicit "latest generation" tracking needed.
+		let writeQueue: Promise<void> = Promise.resolve();
 		const persist =
 			ttlMs > 0
 				? (snapshot: SnapshotResponse): void => {
-						void writeAuthBrokerSnapshotCache({
-							path: cachePath,
-							token: brokerConfig.token,
-							url: brokerConfig.url,
-							snapshot,
-						}).catch(error => {
-							logger.debug("auth-broker snapshot cache write failed", { error: String(error) });
-						});
+						writeQueue = writeQueue.then(() =>
+							writeAuthBrokerSnapshotCache({
+								path: cachePath,
+								token: brokerConfig.token,
+								url: brokerConfig.url,
+								snapshot,
+							}).catch(error => {
+								logger.debug("auth-broker snapshot cache write failed", { error: String(error) });
+							}),
+						);
 					}
 				: undefined;
 

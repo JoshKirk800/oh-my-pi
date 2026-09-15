@@ -12,6 +12,7 @@ import {
 	type SnapshotResponse,
 	startAuthBroker,
 } from "@oh-my-pi/pi-ai/auth-broker";
+import * as snapshotCacheModule from "@oh-my-pi/pi-ai/auth-broker/snapshot-cache";
 import { removeWithRetries } from "../../utils/src/temp";
 import { withEnv } from "./helpers";
 
@@ -593,6 +594,53 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 				} finally {
 					unsubscribe();
 				}
+			} finally {
+				discovered.close();
+			}
+		});
+	});
+
+	test("serializes snapshot-cache writes so a slower older SSE delta write cannot rename over a faster newer one", async () => {
+		await withEnv({ OMP_AUTH_BROKER_URL: handle!.url, OMP_AUTH_BROKER_TOKEN: token }, async () => {
+			const discovered = await discoverAuthStorage({
+				agentDir: tempDir,
+				cachePath: path.join(tempDir, "serialize-snapshot-cache.enc"),
+			});
+			try {
+				// Warm up the SSE connection with the real (unmocked) cache writer
+				// first, so only the two deltas measured below are captured by the
+				// stalled mock installed after this settles.
+				storage!.upsertCredential("anthropic", mintOAuthCredential("warmup", Date.now() + 120_000));
+				await waitUntil(() => discovered.listOAuthAccounts("anthropic").length === 2);
+
+				const releases: Array<() => void> = [];
+				const writeSpy = vi
+					.spyOn(snapshotCacheModule, "writeAuthBrokerSnapshotCache")
+					.mockImplementation(() => new Promise<void>(resolve => releases.push(resolve)));
+
+				// Two entry deltas in close succession: the second's write must
+				// not even be INVOKED until the first's write settles, regardless
+				// of which one would otherwise finish encrypting/renaming faster
+				// -- that ordering, not real disk timing, is what prevents an
+				// older snapshot's write from renaming over a newer one.
+				storage!.upsertCredential("anthropic", mintOAuthCredential("race-a", Date.now() + 120_000));
+				await waitUntil(() => writeSpy.mock.calls.length === 1);
+				storage!.upsertCredential("anthropic", mintOAuthCredential("race-b", Date.now() + 120_000));
+
+				// race-b's store mutation, generation bump, and `persist()` enqueue
+				// all happen synchronously within its onSnapshot delivery; only the
+				// actual write invocation is gated on race-a's write settling, so
+				// this wait is a deterministic signal, not a guessed duration.
+				await waitUntil(() => discovered.listOAuthAccounts("anthropic").length === 4);
+				expect(writeSpy.mock.calls.length).toBe(1);
+
+				releases.shift()!();
+				await waitUntil(() => writeSpy.mock.calls.length === 2);
+				releases.shift()!();
+				await waitUntil(() => releases.length === 0);
+
+				const snapshots = writeSpy.mock.calls.map(call => call[0].snapshot);
+				expect(snapshots[1].generation).toBeGreaterThan(snapshots[0].generation);
 			} finally {
 				discovered.close();
 			}
