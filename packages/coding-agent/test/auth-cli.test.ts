@@ -4,8 +4,15 @@ import * as path from "node:path";
 import { getAgentDbPath, getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { runAuthCommand } from "../src/cli/auth-cli";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
+import { credentialStoreFingerprint } from "../src/slash-commands/helpers/session-pin";
 import { AgentStorage } from "../src/session/agent-storage";
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/session/auth-storage";
+
+/** The scoped durable selector `uniqueStartupSelector` persists for a LOCAL agent dir's default store. */
+function expectedDurableSelector(agentDirPath: string, credentialId: number): string {
+	const fingerprint = credentialStoreFingerprint(`local ${getAgentDbPath(agentDirPath)}`);
+	return fingerprint ? `OAuth credential #${fingerprint}:${credentialId}` : `OAuth credential #${credentialId}`;
+}
 
 function mintOAuthCredential(suffix: string, extra?: { orgId?: string; orgName?: string }) {
 	return {
@@ -122,7 +129,7 @@ describe("omp auth (contract)", () => {
 		const globalRaw = Settings.instance.getGlobalSettings().auth as
 			| { startupOAuthAccount?: Record<string, string> }
 			| undefined;
-		expect(globalRaw?.startupOAuthAccount?.anthropic).toBe("OAuth credential #1");
+		expect(globalRaw?.startupOAuthAccount?.anthropic).toBe(expectedDurableSelector(agentDir.path(), 1));
 		expect(globalRaw?.startupOAuthAccount?.openai).toBeUndefined();
 
 		logs = [];
@@ -218,7 +225,7 @@ describe("omp auth (contract)", () => {
 			| undefined;
 		// Persisted as the durable credential id, not the email that was only
 		// unique at pin time — see `uniqueStartupSelector`'s doc comment.
-		expect(globalRaw?.startupOAuthAccount?.anthropic).toBe("OAuth credential #1");
+		expect(globalRaw?.startupOAuthAccount?.anthropic).toBe(expectedDurableSelector(agentDir.path(), 1));
 
 		// Simulate the same person logging into a second org under the same
 		// email later via `/login` — a record that did not exist when the
@@ -233,5 +240,51 @@ describe("omp auth (contract)", () => {
 		const output = logs.join("\n");
 		expect(output).toContain("solo@example.com (Org A) [pinned]");
 		expect(output).not.toContain("ambiguous");
+	});
+
+	it("a durable selector persisted against one store never resolves against an unrelated store's same numeric id", async () => {
+		// Pin against THIS test's agent dir (the "victim" store): one account,
+		// so it lands at the durable credential id 1.
+		const store = new SqliteAuthCredentialStore(new Database(getAgentDbPath(agentDir.path())));
+		store.saveOAuth("anthropic", mintOAuthCredential("victim"));
+		store.close();
+		await runAuthCommand({ action: "pin", provider: "anthropic", selector: "victim@example.com" });
+		const pinnedSelector = (
+			Settings.instance.getGlobalSettings().auth as { startupOAuthAccount?: Record<string, string> } | undefined
+		)?.startupOAuthAccount?.anthropic;
+		if (!pinnedSelector) throw new Error("expected a persisted selector");
+		expect(pinnedSelector).toBe(expectedDurableSelector(agentDir.path(), 1));
+
+		// A completely separate agent dir/store -- an unrelated `agent.db` with
+		// its own independent autoincrement, whose first Anthropic account
+		// ALSO lands at credential id 1. Simulates a broker toggled off (falls
+		// back to local SQLite) or a different broker URL selected: same
+		// selector string, a different physical store behind it.
+		const otherAgentDir = TempDir.createSync("@omp-auth-cli-other-agent-");
+		try {
+			const otherStore = new SqliteAuthCredentialStore(new Database(getAgentDbPath(otherAgentDir.path())));
+			otherStore.saveOAuth("anthropic", mintOAuthCredential("attacker"));
+			otherStore.close();
+
+			setAgentDir(otherAgentDir.path());
+			resetSettingsForTest();
+			await Settings.init({ agentDir: otherAgentDir.path(), cwd: projectDir.path() });
+			// Carry the victim store's persisted selector over verbatim, as if
+			// config.yml itself had been copied or the broker toggled.
+			Settings.instance.set("auth.startupOAuthAccount", { anthropic: pinnedSelector });
+			await Settings.instance.flush();
+
+			logs = [];
+			errors = [];
+			await runAuthCommand({ action: "accounts", provider: "anthropic" });
+			const output = logs.join("\n");
+			// Before the fix, the bare `OAuth credential #1` form would resolve
+			// against THIS store's own credential id 1 -- the unrelated
+			// "attacker" account -- and mark it [pinned].
+			expect(output).not.toContain("[pinned]");
+			expect(output).toContain("no longer valid");
+		} finally {
+			await otherAgentDir.remove().catch(() => {});
+		}
 	});
 });

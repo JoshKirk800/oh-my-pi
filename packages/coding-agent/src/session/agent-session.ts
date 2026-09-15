@@ -192,7 +192,7 @@ import {
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
 import { flushSharpshooterExtraction } from "../sharpshooter/extract";
-import { matchOAuthAccountsBySelector } from "../slash-commands/helpers/session-pin";
+import { credentialStoreFingerprint, matchOAuthAccountsBySelector } from "../slash-commands/helpers/session-pin";
 import { toolReadsSkillUris } from "../system-prompt";
 import {
 	AUTO_THINKING,
@@ -10813,7 +10813,9 @@ export class AgentSession {
 			this.#pendingStartupOAuthPins.delete(key);
 			return;
 		}
-		const matches = matchOAuthAccountsBySelector(accounts, selector);
+		const matches = matchOAuthAccountsBySelector(accounts, selector, {
+			storeFingerprint: credentialStoreFingerprint(authStorage.getSourceLabel()),
+		});
 		if (matches.length !== 1) {
 			if (!hasActive) this.#pendingStartupOAuthPins.add(key);
 			return;

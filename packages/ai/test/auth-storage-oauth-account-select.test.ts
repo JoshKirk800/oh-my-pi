@@ -241,6 +241,38 @@ describe("AuthStorage OAuth account selection", () => {
 		expect(await storage.getOAuthAccessAt(PROVIDER, -1)).toBeUndefined();
 	});
 
+	test("reload batches multiple provider changes into one generation notification", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+
+		// A second SQLite connection stands in for another omp process. Its
+		// updates arrive together in the one listAuthCredentials() snapshot
+		// reload reads.
+		const writer = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		try {
+			writer.saveOAuth(PROVIDER, oauthCredential("reload-a"));
+			writer.saveOAuth("unit-oauth-reload-other", oauthCredential("reload-b"));
+		} finally {
+			writer.close();
+		}
+
+		const initialGeneration = storage.getGeneration();
+		const observedGenerations: number[] = [];
+		const unsubscribe = storage.onGenerationChanged(generation => observedGenerations.push(generation));
+		try {
+			await storage.reload();
+		} finally {
+			unsubscribe();
+		}
+
+		// One logical external snapshot is one generation transition, so
+		// subscribers retry startup pinning only after the full view is ready.
+		expect(storage.getGeneration()).toBe(initialGeneration + 1);
+		expect(observedGenerations).toEqual([initialGeneration + 1]);
+		expect(storage.listOAuthAccounts(PROVIDER)).toHaveLength(1);
+		expect(storage.listOAuthAccounts("unit-oauth-reload-other")).toHaveLength(1);
+	});
+
 	test("getOAuthAccessAt fails the requested account without touching siblings", async () => {
 		const storage = authStorage;
 		if (!storage) throw new Error("test setup failed");

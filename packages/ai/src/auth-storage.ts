@@ -1425,6 +1425,18 @@ export class AuthStorage {
 	#pendingDisabledEvents: CredentialDisabledEvent[] = [];
 	#generation = 1;
 	#generationListeners: Set<(generation: number) => void> = new Set();
+	/**
+	 * When set, `#setStoredCredentials` applies its update but skips its own
+	 * `#bumpGeneration` call. `reload()` sets this while looping over every
+	 * provider so a subscriber can never observe a partially-applied reload:
+	 * without it, the first provider's own generation bump fires listeners
+	 * synchronously while every LATER provider in the same loop still holds
+	 * its pre-reload data, and a subscriber re-reading `listOAuthAccounts`
+	 * for one of those not-yet-processed providers wrongly concludes a
+	 * resumed pin's account is absent when the very next iteration of this
+	 * same loop was about to restore it.
+	 */
+	#suppressGenerationBump = false;
 	#oauthRefreshInFlight: Map<number, Promise<AuthCredentialSnapshotEntry>> = new Map();
 	#oauthCredentialRefreshInFlight: Map<number, Promise<OAuthCredentials>> = new Map();
 	#closed = false;
@@ -1491,6 +1503,18 @@ export class AuthStorage {
 
 	getGeneration(): number {
 		return this.#generation;
+	}
+
+	/**
+	 * Identifies the physical credential store this instance reads from (e.g.
+	 * `local <dbPath>` or `broker <url>`). Autoincremented `credentialId`
+	 * values are only unique WITHIN one store -- a durable selector persisted
+	 * across process restarts (`auth.startupOAuthAccount`) must fold this into
+	 * its fingerprint, or a store change (broker toggled off, URL changed)
+	 * lets an unrelated credential silently take over the same numeric id.
+	 */
+	getSourceLabel(): string | undefined {
+		return this.#sourceLabel;
 	}
 
 	/**
@@ -1700,13 +1724,24 @@ export class AuthStorage {
 		}
 
 		const removedProviders = new Set(this.#data.keys());
-		for (const [provider, entries] of dedupedGrouped) {
-			this.#setStoredCredentials(provider, entries);
-			removedProviders.delete(provider);
+		// Suppress each provider's own generation bump while applying every
+		// update from this one `listAuthCredentials()` snapshot: without this,
+		// the FIRST changed provider can make startup-pin subscribers retry
+		// against a partially refreshed view.
+		this.#suppressGenerationBump = true;
+		let anyChanged = false;
+		try {
+			for (const [provider, entries] of dedupedGrouped) {
+				if (this.#setStoredCredentials(provider, entries)) anyChanged = true;
+				removedProviders.delete(provider);
+			}
+			for (const provider of removedProviders) {
+				if (this.#setStoredCredentials(provider, [])) anyChanged = true;
+			}
+		} finally {
+			this.#suppressGenerationBump = false;
 		}
-		for (const provider of removedProviders) {
-			this.#setStoredCredentials(provider, []);
-		}
+		if (anyChanged) this.#bumpGeneration("credentials");
 	}
 
 	/**
@@ -1724,9 +1759,9 @@ export class AuthStorage {
 	 * @param provider - Provider name (e.g., "anthropic", "openai")
 	 * @param credentials - Array of stored credentials to cache
 	 */
-	#setStoredCredentials(provider: string, credentials: StoredCredential[]): void {
+	#setStoredCredentials(provider: string, credentials: StoredCredential[]): boolean {
 		const current = this.#data.get(provider) ?? [];
-		if (storedCredentialArraysEqual(current, credentials)) return;
+		if (storedCredentialArraysEqual(current, credentials)) return false;
 		// Every EXPLICIT mutation (set/removeCredential/disable/replace) already
 		// calls `#resetProviderAssignments()` right after this method runs,
 		// which purges the index-keyed backoff/probe maps below. `reload()` is
@@ -1774,7 +1809,8 @@ export class AuthStorage {
 		} else {
 			this.#data.set(provider, credentials);
 		}
-		this.#bumpGeneration("credentials");
+		if (!this.#suppressGenerationBump) this.#bumpGeneration("credentials");
+		return true;
 	}
 
 	#recordOAuthBearerCredentialId(provider: string, bearer: string, credentialId: number | undefined): void {

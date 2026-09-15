@@ -14,7 +14,7 @@ import chalk from "@oh-my-pi/pi-utils/chalk";
 import { settings } from "../config/settings";
 import { discoverAuthStorage } from "../sdk";
 import type { OAuthAccountSummary } from "../session/auth-storage";
-import { matchOAuthAccountsBySelector } from "../slash-commands/helpers/session-pin";
+import { credentialStoreFingerprint, matchOAuthAccountsBySelector } from "../slash-commands/helpers/session-pin";
 
 export type AuthAction = "accounts" | "pin" | "unpin";
 
@@ -48,9 +48,20 @@ function accountLabel(account: OAuthAccountSummary): string {
  * credential id is the only value invariant under both of those future
  * events, so it is used unconditionally rather than only as a fallback for
  * a collision that already exists today.
+ *
+ * The id alone is only unique WITHIN one physical credential store, though
+ * — a broker toggled off (falls back to local SQLite) or pointed at a
+ * different `OMP_AUTH_BROKER_URL` can autoincrement an unrelated
+ * credential to the same numeric id. `storeFingerprint` (from
+ * `credentialStoreFingerprint(authStorage.getSourceLabel())`) folds the
+ * store's own identity into the persisted form when available, so
+ * `matchOAuthAccountsBySelector` only accepts the id against the SAME
+ * store it was pinned against.
  */
-function uniqueStartupSelector(account: OAuthAccountSummary): string {
-	return `OAuth credential #${account.credentialId}`;
+function uniqueStartupSelector(account: OAuthAccountSummary, storeFingerprint: string | undefined): string {
+	return storeFingerprint
+		? `OAuth credential #${storeFingerprint}:${account.credentialId}`
+		: `OAuth credential #${account.credentialId}`;
 }
 
 /**
@@ -122,6 +133,7 @@ export async function runAuthCommand(cmd: AuthCommandArgs): Promise<void> {
 			console.error(chalk.dim(`Could not refresh accounts from the auth broker; showing the cached list: ${error}`));
 		});
 		const accounts = authStorage.listOAuthAccounts(provider);
+		const storeFingerprint = credentialStoreFingerprint(authStorage.getSourceLabel());
 		if (accounts.length === 0) {
 			console.error(chalk.red(`No stored OAuth accounts for "${provider}". Use /login to add one.`));
 			process.exitCode = 1;
@@ -137,7 +149,9 @@ export async function runAuthCommand(cmd: AuthCommandArgs): Promise<void> {
 				provider
 			];
 			const pinnedSelector = typeof configuredValue === "string" ? configuredValue.trim() : undefined;
-			const pinnedMatches = pinnedSelector ? matchOAuthAccountsBySelector(accounts, pinnedSelector) : [];
+			const pinnedMatches = pinnedSelector
+				? matchOAuthAccountsBySelector(accounts, pinnedSelector, { storeFingerprint })
+				: [];
 			const pinnedId = pinnedMatches.length === 1 ? pinnedMatches[0].credentialId : undefined;
 			for (const account of accounts) {
 				const pinned = account.credentialId === pinnedId ? chalk.dim(" [pinned]") : "";
@@ -167,7 +181,7 @@ export async function runAuthCommand(cmd: AuthCommandArgs): Promise<void> {
 			process.exitCode = 1;
 			return;
 		}
-		const matches = matchOAuthAccountsBySelector(accounts, cmd.selector);
+		const matches = matchOAuthAccountsBySelector(accounts, cmd.selector, { storeFingerprint });
 		if (matches.length === 0) {
 			console.error(chalk.red(`No "${provider}" account matches "${cmd.selector}".`));
 			process.exitCode = 1;
@@ -186,7 +200,7 @@ export async function runAuthCommand(cmd: AuthCommandArgs): Promise<void> {
 		}
 
 		const account = matches[0];
-		const selector = uniqueStartupSelector(account);
+		const selector = uniqueStartupSelector(account, storeFingerprint);
 		const configured = globalStartupOAuthAccounts();
 		configured[provider] = selector;
 		settings.set("auth.startupOAuthAccount", configured);
