@@ -33,6 +33,7 @@
 - Fixed provider requests failing with `ENOENT` when another process removes a stale shared concurrency lock during acquisition.
 - Fixed Devin-hosted Gemini models rejecting turns that include nullable tool parameters by normalizing tool schemas to Gemini's supported JSON Schema dialect ([#8647](https://github.com/can1357/oh-my-pi/issues/8647), [#10233](https://github.com/can1357/oh-my-pi/pull/10233) by [@will-bogusz](https://github.com/will-bogusz)).
 - Fixed Devin gateway failures leaking raw proxy HTML into turn errors; HTTP status and retry metadata remain available for recovery ([#10233](https://github.com/can1357/oh-my-pi/pull/10233) by [@will-bogusz](https://github.com/will-bogusz)).
+- Fixed a session's sticky OAuth/API-key account silently repointing to whatever credential now occupies its old storage position after the credential list was reordered or shrank mid-process (a sibling `/logout` from another process, or an auth-broker snapshot delivery): the in-memory sticky is now re-resolved from its durable credential id on every read, matching the persisted-cache path. A background auth-broker snapshot delivery now also refreshes `AuthStorage`'s own cached view and bumps its generation, so `onGenerationChanged` subscribers see accounts that appeared after the cached startup snapshot ([#11717](https://github.com/can1357/oh-my-pi/pull/11717) by [@JoshKirk800](https://github.com/JoshKirk800)).
 
 ## [18.2.0] - 2026-09-15
 
@@ -43,9 +44,6 @@
 ### Fixed
 
 - Fixed OpenCode Go window-limit 429s (`5-hour`/`Weekly`/`Monthly usage limit reached. Resets in …`) not pinning the exhausted credential to the server-stated reset; the window phrasing is now covered by a regression test over the rotation classifier. ([#12091](https://github.com/can1357/oh-my-pi/pull/12091) by [@H4vC](https://github.com/H4vC))
-### Fixed
-
-- Fixed a session's sticky OAuth/API-key account silently repointing to whatever credential now occupies its old storage position after the credential list was reordered or shrank mid-process (a sibling `/logout` from another process, or an auth-broker snapshot delivery): the in-memory sticky is now re-resolved from its durable credential id on every read, matching the persisted-cache path. A background auth-broker snapshot delivery now also refreshes `AuthStorage`'s own cached view and bumps its generation, so `onGenerationChanged` subscribers see accounts that appeared after the cached startup snapshot ([#11717](https://github.com/can1357/oh-my-pi/pull/11717) by [@JoshKirk800](https://github.com/JoshKirk800)).
 
 ## [18.1.22] - 2026-09-14
 

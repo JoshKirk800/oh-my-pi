@@ -122,6 +122,7 @@ describe("AuthStorage OAuth account selection", () => {
 				sessionId: "child-session",
 			}),
 		).toBe("a@example.com");
+	});
 
 	test("keeps the correct account active after reload() reorders credentials mid-process", async () => {
 		const storage = authStorage;
